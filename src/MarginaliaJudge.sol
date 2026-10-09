@@ -9,29 +9,30 @@ import {IIntake} from "./interfaces/IIntake.sol";
 
 interface IHookJudge {
     function imd() external view returns (address);
-    function potImd(uint32 day) external view returns (uint256);
+    function thesisPool(uint32 week) external view returns (uint256);
     function potMarg() external view returns (uint256);
-    function today() external view returns (uint32);
-    function notesOfDay(uint32 day) external view returns (bytes32[] memory);
-    function noteMeta(bytes32 id) external view returns (address author, uint32 day);
+    function week() external view returns (uint32);
+    function thesesOfWeek(uint32 week) external view returns (bytes32[] memory);
+    function noteMeta(bytes32 id) external view returns (address author, uint32 week, bool thesis);
     function sellPotMarg(uint256 amount) external returns (uint256);
     function drawForJudging(uint32 day, uint256 amount) external;
     function payJudged(uint32 day, bytes32[3] calldata top) external;
     function JUDGE_PRICE() external view returns (uint256);
 }
 
-/// @notice The oracle consumer and a permissionless helper: once per UTC day, converts forfeited MARG,
-/// draws the oracle's price from the pot, buys the panel's ranking of the day's notes, verifies the signed
-/// answer, and tells the hook whom to pay. Deployed by the hook; no owner.
+/// @notice The oracle consumer and a permissionless helper: once per week, converts forfeited MARG, draws
+/// the oracle's price from the thesis pool, buys the panel's ranking of the week's long-form theses, verifies
+/// the signed answer, and tells the hook whom to pay. Short-form calls are never judged: they resolve against
+/// price and score the leaderboard. Deployed by the hook; no owner.
 contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     uint16 public constant PANEL_SIZE = 7;
     uint16 public constant QUORUM = 5;
 
-    IHookJudge public immutable hook;
-    IIntake public immutable intake;
-    bytes32 public immutable action;
+    IHookJudge public hook;
+    IIntake public intake;
+    bytes32 public action;
 
     mapping(uint32 => bytes32) public requestOf;
     mapping(bytes32 => uint32) private pendingDay; // day + 1, never zero
@@ -48,15 +49,22 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
     error BadAnswer();
     error NotJudged();
     error AlreadyPaid();
+    error AlreadyInitialised();
 
     event Requested(uint32 indexed day, bytes32 indexed requestId, uint256 price);
     event Judged(uint32 indexed day, bytes32[3] ids);
 
-    constructor(address hook_, address intake_, bytes32 action_, address signer_) OracleAttestationConsumer(signer_) {
+    /// @dev The implementation carries a placeholder signer; a clone gets the real one from `init`.
+    constructor() OracleAttestationConsumer(address(1)) {}
+
+    /// @dev Called once by the hook on its clone, in the hook's constructor.
+    function init(address hook_, address intake_, bytes32 action_, address signer_) external {
+        if (address(hook) != address(0)) revert AlreadyInitialised();
         require(hook_ != address(0) && intake_ != address(0) && action_ != bytes32(0), "configuration required");
         hook = IHookJudge(hook_);
         intake = IIntake(intake_);
         action = action_;
+        _setOracleSigner(signer_);
     }
 
     /// @notice Converts any forfeited MARG into IMD for today's pot. Anyone, any time.
@@ -67,17 +75,17 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
     }
 
     /// @notice The oracle body for a day: deterministic from the day's note ids, so anyone can check it.
-    function questionBody(uint32 day) public view returns (string memory) {
-        bytes32[] memory ids = hook.notesOfDay(day);
+    function questionBody(uint32 week) public view returns (string memory) {
+        bytes32[] memory ids = hook.thesesOfWeek(week);
         bytes memory allow;
         for (uint256 i = 0; i < ids.length; ++i) {
             allow = bytes.concat(allow, i == 0 ? bytes('"') : bytes(',"'), _hex(uint256(ids[i]), 32), bytes('"'));
         }
         return string(
             bytes.concat(
-                bytes('{"v":1,"question":"Rank the three best-argued Marginalia notes among these ids by verifiable reasoning (on-chain reads, named addresses, holder or liquidity facts, mechanism arguments). Direction-only notes score zero. Ignore whether the call proved right.","chainId":'),
+                bytes('{"v":1,"question":"Rank the three best-argued Marginalia theses among these ids by verifiable reasoning and citations (on-chain reads, named addresses, holder or liquidity facts, mechanism arguments, sourced claims). A thesis without reasoning scores zero. Ignore whether its calls proved right.","chainId":'),
                 _dec(block.chainid),
-                bytes(',"window":{"hours":24},"answerType":"bytes32[]","evidence":"panel","head":3,"panelSize":'),
+                bytes(',"window":{"hours":168},"answerType":"bytes32[]","evidence":"panel","head":3,"panelSize":'),
                 _dec(PANEL_SIZE),
                 bytes(',"quorum":'),
                 _dec(QUORUM),
@@ -115,11 +123,11 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
         return out;
     }
 
-    /// @notice Buys the panel's ranking for a finished day whose pot clears the hook's threshold.
+    /// @notice Buys the panel's ranking for a finished week whose thesis pool clears the hook's threshold.
     function requestJudging(uint32 day) external nonReentrant returns (bytes32 requestId) {
-        if (day >= hook.today()) revert DayNotOver();
+        if (day >= hook.week()) revert DayNotOver();
         if (requestOf[day] != bytes32(0)) revert AlreadyRequested();
-        if (hook.notesOfDay(day).length == 0) revert NoNotes();
+        if (hook.thesesOfWeek(day).length == 0) revert NoNotes();
         address imd = hook.imd();
         uint256 price = intake.priceOf(action, imd);
         if (price == 0 || price != hook.JUDGE_PRICE()) revert PriceMismatch();
@@ -151,8 +159,8 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
         bytes32[3] memory top;
         uint256 kept;
         for (uint256 i = 0; i < ranked.length && kept < 3; ++i) {
-            (address author, uint32 noteDay) = hook.noteMeta(ranked[i]);
-            if (author == address(0) || noteDay != day) continue;
+            (address author, uint32 noteWeek, bool thesis) = hook.noteMeta(ranked[i]);
+            if (author == address(0) || noteWeek != day || !thesis) continue;
             bool dup;
             for (uint256 k = 0; k < kept; ++k) {
                 if (top[k] == ranked[i]) dup = true;

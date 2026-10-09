@@ -17,6 +17,9 @@ import {MarginaliaRouter} from "../../src/MarginaliaRouter.sol";
 import {HookFlags} from "../../src/HookFlags.sol";
 import {MarginaliaTypes as T} from "../../src/MarginaliaTypes.sol";
 import {ILaunchFactory} from "../../src/interfaces/ILaunchFactory.sol";
+import {MarginaliaJudge} from "../../src/MarginaliaJudge.sol";
+import {MarginaliaTreasury} from "../../src/MarginaliaTreasury.sol";
+import {MarginaliaImpls} from "../../src/MarginaliaImpls.sol";
 
 /// @notice The rehearsal: the real IMD LaunchFactory on a mainnet fork, impersonating its launch wallet,
 /// deploys Marginalia exactly as a protocol launch would, then a user posts a note through the router.
@@ -71,6 +74,10 @@ contract MainnetLaunchTest is Test {
     }
 
     function _launch() internal {
+        // On mainnet the implementations come from the preceding contracts-only launch; here they are etched.
+        vm.etch(MarginaliaImpls.ROUTER_IMPL, address(new MarginaliaRouter()).code);
+        vm.etch(MarginaliaImpls.JUDGE_IMPL, address(new MarginaliaJudge()).code);
+        vm.etch(MarginaliaImpls.TREASURY_IMPL, address(new MarginaliaTreasury()).code);
         bytes memory tokenCode = type(Marginalia).creationCode;
         address predictedToken = FACTORY.predictToken(LAUNCH_NUMBER, tokenCode);
         bytes memory hookCode =
@@ -303,7 +310,7 @@ contract MainnetLaunchTest is Test {
         assertApproxEqRel(n.postPrice, 1e18, 0.01e18); // IMD priced in IMD through the hub ≈ 1
         assertGt(received, 0);
         assertGt(n.deposit, 0);
-        assertEq(hook.potImd(hook.today()), hook.STAMP());
+        assertEq(hook.refundPool(hook.today()) + hook.leaderboardPool(hook.week()) + hook.thesisPool(hook.week()), hook.STAMP());
         emit log_named_uint("MARG received for 20 IMD", received);
         emit log_named_uint("deposit (MARG)", n.deposit);
         emit log_named_uint("post price of IMD in IMD (1e18)", n.postPrice);

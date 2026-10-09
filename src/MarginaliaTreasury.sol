@@ -16,16 +16,19 @@ contract MarginaliaTreasury {
     using SafeERC20 for IERC20;
 
     uint256 public constant DRIP_BPS = 200;
-    IHookPot public immutable hook;
+    IHookPot public hook;
     uint32 public lastDripDay;
 
     error AlreadyDripped();
     error NothingToDrip();
+    error AlreadyInitialised();
 
     event Dripped(uint32 indexed day, uint256 amount);
     event Received(address indexed from, uint256 amount);
 
-    constructor(address hook_) {
+    /// @dev Called once by the hook on its clone, in the hook's constructor.
+    function init(address hook_) external {
+        if (address(hook) != address(0)) revert AlreadyInitialised();
         require(hook_ != address(0), "configuration required");
         hook = IHookPot(hook_);
     }

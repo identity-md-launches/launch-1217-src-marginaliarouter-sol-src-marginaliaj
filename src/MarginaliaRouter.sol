@@ -41,8 +41,8 @@ interface IUniswapV2PairSwap {
 contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    IPoolManager public immutable manager;
-    IMarginaliaHook public immutable hook;
+    IPoolManager public manager;
+    IMarginaliaHook public hook;
 
     uint8 public constant X_NONE = 0;
     uint8 public constant X_V4 = 1;
@@ -80,11 +80,15 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
     error Slippage();
     error Expired();
     error NoteTokenMismatch();
+    error AlreadyInitialised();
 
     event Noted(address indexed author, bool sellMarg, uint256 spent, uint256 received);
     event XTraded(address indexed trader, uint8 kind, address indexed xIn, address indexed xOut, uint256 spent, uint256 received);
 
-    constructor(IPoolManager manager_, address hook_) {
+    /// @dev Called once by the hook on its clone, in the hook's constructor. The implementation itself is
+    /// never initialised and holds nothing.
+    function init(IPoolManager manager_, address hook_) external {
+        if (address(hook) != address(0)) revert AlreadyInitialised();
         require(address(manager_).code.length > 0 && hook_ != address(0), "configuration required");
         manager = manager_;
         hook = IMarginaliaHook(hook_);

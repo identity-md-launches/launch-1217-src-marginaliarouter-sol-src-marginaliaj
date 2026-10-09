@@ -21,6 +21,7 @@ import {MarginaliaTreasury} from "../../src/MarginaliaTreasury.sol";
 import {MarginaliaJudge} from "../../src/MarginaliaJudge.sol";
 import {HookFlags} from "../../src/HookFlags.sol";
 import {MarginaliaTypes as T} from "../../src/MarginaliaTypes.sol";
+import {MarginaliaImpls} from "../../src/MarginaliaImpls.sol";
 import {MockERC20} from "../mocks/MockERC20.sol";
 import {IIntake} from "../../src/interfaces/IIntake.sol";
 
@@ -146,7 +147,15 @@ abstract contract Fixture is Test {
     address internal bob = makeAddr("bob");
     address internal carol = makeAddr("carol");
 
+    /// @dev The implementations live at fixed addresses the hook clones from; put real code there.
+    function _etchImpls() internal {
+        vm.etch(MarginaliaImpls.ROUTER_IMPL, address(new MarginaliaRouter()).code);
+        vm.etch(MarginaliaImpls.JUDGE_IMPL, address(new MarginaliaJudge()).code);
+        vm.etch(MarginaliaImpls.TREASURY_IMPL, address(new MarginaliaTreasury()).code);
+    }
+
     function _deployHook(IPoolManager m, address t) internal returns (MarginaliaHook result) {
+        _etchImpls();
         bytes memory code = abi.encodePacked(type(MarginaliaHook).creationCode, abi.encode(m, t, address(this)));
         bytes32 hash = keccak256(code);
         for (uint256 i = 0; i < 300_000; ++i) {

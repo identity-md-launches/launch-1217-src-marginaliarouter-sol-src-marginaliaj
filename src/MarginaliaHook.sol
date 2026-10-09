@@ -22,6 +22,8 @@ import {PriceAdapters} from "./PriceAdapters.sol";
 import {MarginaliaTreasury} from "./MarginaliaTreasury.sol";
 import {MarginaliaRouter} from "./MarginaliaRouter.sol";
 import {MarginaliaJudge} from "./MarginaliaJudge.sol";
+import {MarginaliaImpls} from "./MarginaliaImpls.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 
 /// @title Marginalia: notes in the margin of every trade
 /// @notice A Uniswap v4 hook on the MARG/IMD launch pool. Buying MARG through the router with a note in
@@ -53,8 +55,12 @@ contract MarginaliaHook is IUnlockCallback {
     uint256 public constant OBS_GAP_BLOCKS = 20;
     uint256 public constant KEEPER_BPS = 200;
     uint256 public constant MAX_DAY_NOTES = 256;
-    uint256 public constant JUDGE_THRESHOLD = 2 ether; // IMD
+    uint256 public constant JUDGE_THRESHOLD = 2 ether; // IMD, in the week's thesis pot
     uint256 public constant JUDGE_PRICE = 0.5 ether; // IMD, the Intake's oracle.request price
+    uint256 public constant LEADERBOARD_BPS = 5000; // of every accrual: the week's score-weighted pool
+    uint256 public constant THESIS_BPS = 3000; // the week's judged thesis prize
+    uint256 public constant LEADERBOARD_CAP_BPS = 1000; // no wallet takes more than 10% of a week's pool
+    uint256 public constant SWEEP_AFTER = 28 days; // unclaimed pools roll forward after this
     uint256 public constant LP_FEE = 12_500;
 
     /// @dev IMD-denominated market-cap tiers for the difficulty score (~$1M / ~$10M at IMD ≈ $9).
@@ -89,7 +95,6 @@ contract MarginaliaHook is IUnlockCallback {
     uint256 public noteCount;
     mapping(bytes32 => T.Note) private notes;
     mapping(bytes32 => T.Observation[]) private observations;
-    mapping(uint32 => bytes32[]) private dayNotes;
 
     struct Record {
         int256 score;
@@ -105,11 +110,22 @@ contract MarginaliaHook is IUnlockCallback {
 
     // ------------------------------------------------------------------ pot and judging
 
-    /// @dev IMD held as ERC-6909 claims, by UTC day of accrual.
-    mapping(uint32 => uint256) public potImd;
-    /// @dev Forfeited MARG held as claims, converted to IMD by the judge before judging.
+    /// @dev Every IMD accrual (stamps, fees, forfeits, drips) splits three ways at accrual time, all held
+    /// as ERC-6909 claims: the week's leaderboard pool, the week's thesis prize, the day's writer refund.
+    mapping(uint32 => uint256) public leaderboardPool; // by week
+    mapping(uint32 => uint256) public thesisPool; // by week
+    mapping(uint32 => uint256) public refundPool; // by day
+    /// @dev Forfeited MARG held as claims, converted to IMD by the judge.
     uint256 public potMarg;
     mapping(uint32 => bool) public judgedPaid;
+    /// @dev Score earned per wallet per week, and the week's sum of positive scores (the pro-rata base).
+    mapping(uint32 => mapping(address => int256)) public weekScore;
+    mapping(uint32 => uint256) public weekTotal;
+    mapping(uint32 => mapping(address => bool)) public leaderboardClaimed;
+    mapping(uint32 => uint256) public leaderboardSwept;
+    mapping(uint32 => uint32) public notesPerDay;
+    mapping(bytes32 => bool) public refundClaimed;
+    mapping(uint32 => bytes32[]) private weekTheses;
 
     // ------------------------------------------------------------------ transient-ish scratch
 
@@ -139,6 +155,7 @@ contract MarginaliaHook is IUnlockCallback {
     error InvalidUnlock();
     error PotTooSmall();
     error QuoteNotPriceable();
+    error NothingToSweep();
 
     event PoolBound(PoolId indexed poolId, address indexed imd);
     event SwapFee(bool indexed buy, address indexed trader, uint256 poolImd, uint256 fee, uint256 stamp);
@@ -163,6 +180,10 @@ contract MarginaliaHook is IUnlockCallback {
     event ThesisReleased(bytes32 indexed id);
     event ThesisForfeited(bytes32 indexed id);
     event PotFunded(uint32 indexed day, uint256 amount, address indexed source);
+    event Accrued(uint32 indexed day, uint256 amount);
+    event LeaderboardClaimed(uint32 indexed week, address indexed wallet, uint256 amount);
+    event RefundClaimed(bytes32 indexed id, address indexed wallet, uint256 amount);
+    event Swept(uint8 kind, uint32 indexed epoch, uint256 amount);
     event PotMargSold(uint256 marg, uint256 imdOut, uint32 indexed day);
     event JudgedPaid(uint32 indexed day, uint256[3] amounts);
 
@@ -177,9 +198,16 @@ contract MarginaliaHook is IUnlockCallback {
         token = token_;
         factory = factory_;
         Hooks.validateHookPermissions(IHooks(address(this)), getHookPermissions());
-        treasury = new MarginaliaTreasury(address(this));
-        router = new MarginaliaRouter(poolManager_, address(this));
-        judge = new MarginaliaJudge(address(this), INTAKE, ACTION, ORACLE_SIGNER);
+        // Companions are EIP-1167 clones of audited implementations, initialised here and never again.
+        MarginaliaTreasury t = MarginaliaTreasury(payable(Clones.clone(MarginaliaImpls.TREASURY_IMPL)));
+        t.init(address(this));
+        treasury = t;
+        MarginaliaRouter r = MarginaliaRouter(Clones.clone(MarginaliaImpls.ROUTER_IMPL));
+        r.init(poolManager_, address(this));
+        router = r;
+        MarginaliaJudge j = MarginaliaJudge(Clones.clone(MarginaliaImpls.JUDGE_IMPL));
+        j.init(address(this), INTAKE, ACTION, ORACLE_SIGNER);
+        judge = j;
     }
 
     modifier onlyManager() {
@@ -289,7 +317,6 @@ contract MarginaliaHook is IUnlockCallback {
         if ((buy && imdDelta >= 0) || (!buy && imdDelta <= 0)) revert PartialFill();
         uint256 poolImd = buy ? uint256(uint128(-imdDelta)) : uint256(uint128(imdDelta));
         uint8 kind = _dataKind(sender, data);
-        uint32 day = _today();
 
         if (buy) {
             if (kind != T.DATA_NOTE) return (IHooks.afterSwap.selector, 0);
@@ -300,7 +327,7 @@ contract MarginaliaHook is IUnlockCallback {
             if (margOut <= depositMarg + 1) revert NoteTooSmall();
             poolManager.mint(address(this), _id(imd), STAMP);
             poolManager.mint(address(this), _id(token), depositMarg);
-            potImd[day] += STAMP;
+            _accrue(STAMP);
             (T.NoteParams memory p, address author, uint256 xResult) = _decodeNote(data);
             _postNote(author, p, xResult, depositMarg);
             emit SwapFee(true, author, poolImd, 0, STAMP);
@@ -316,7 +343,7 @@ contract MarginaliaHook is IUnlockCallback {
             if (poolImd <= fee) revert NoteTooSmall();
             poolManager.mint(address(this), _id(imd), fee);
             poolManager.mint(address(this), _id(token), depositMarg);
-            potImd[day] += fee;
+            _accrue(fee);
             (T.NoteParams memory p, address author, uint256 xResult) = _decodeNote(data);
             _postNote(author, p, xResult, depositMarg);
             emit SwapFee(false, author, poolImd, fee - STAMP, STAMP);
@@ -336,10 +363,22 @@ contract MarginaliaHook is IUnlockCallback {
         }
         if (quietFee > 0) {
             poolManager.mint(address(this), _id(imd), quietFee);
-            potImd[day] += quietFee;
+            _accrue(quietFee);
         }
         emit SwapFee(false, tx.origin, poolImd, quietFee, 0);
         return (IHooks.afterSwap.selector, returned);
+    }
+
+    /// @dev Splits an IMD accrual into the three pools.
+    function _accrue(uint256 amount) private {
+        uint32 day = _today();
+        uint32 week = _week();
+        uint256 lb = amount * LEADERBOARD_BPS / 10_000;
+        uint256 th = amount * THESIS_BPS / 10_000;
+        leaderboardPool[week] += lb;
+        thesisPool[week] += th;
+        refundPool[day] += amount - lb - th;
+        emit Accrued(day, amount);
     }
 
     function _decodeNote(bytes calldata data) private pure returns (T.NoteParams memory p, address author, uint256 xResult) {
@@ -384,8 +423,10 @@ contract MarginaliaHook is IUnlockCallback {
         n.deposit = depositMarg;
         n.parentId = p.parentId;
         n.textHash = keccak256(bytes(p.text));
+        notesPerDay[n.day] += 1;
         if (thesis) {
             n.status = T.Status.ThesisOpen;
+            if (weekTheses[_week()].length < MAX_DAY_NOTES) weekTheses[_week()].push(id);
         } else {
             n.postPrice = _priceInImd(p.venue);
             n.postBalance = IERC20(p.x).balanceOf(author);
@@ -394,7 +435,6 @@ contract MarginaliaHook is IUnlockCallback {
                 if (parent.author != author || parent.status != T.Status.ThesisOpen) revert InvalidNote();
                 parent.children += 1;
             }
-            if (dayNotes[n.day].length < MAX_DAY_NOTES) dayNotes[n.day].push(id);
         }
         records[author].posted += 1;
         emit NotePosted(
@@ -484,6 +524,7 @@ contract MarginaliaHook is IUnlockCallback {
             _forfeit(n, msg.sender);
         }
         r.score += scoreDelta;
+        _bookWeekScore(n.author, scoreDelta);
         _resolveChild(n);
         emit Settled(id, outcome, settlePrice, scoreDelta, msg.sender);
     }
@@ -499,6 +540,7 @@ contract MarginaliaHook is IUnlockCallback {
         Record storage r = records[n.author];
         r.retracted += 1;
         r.score += scoreDelta;
+        _bookWeekScore(n.author, scoreDelta);
         _forfeit(n, address(0));
         _resolveChild(n);
         emit Retracted(id, text);
@@ -614,69 +656,141 @@ contract MarginaliaHook is IUnlockCallback {
         return uint32(block.timestamp / 1 days);
     }
 
+    function _week() private view returns (uint32) {
+        return uint32(block.timestamp / 7 days);
+    }
+
     function today() external view returns (uint32) {
         return _today();
     }
 
-    function notesOfDay(uint32 day) external view returns (bytes32[] memory) {
-        return dayNotes[day];
+    function week() external view returns (uint32) {
+        return _week();
     }
 
-    /// @notice Moves ERC-20 IMD from the caller into today's pot (the treasury's drip, or anyone's gift).
+    function thesesOfWeek(uint32 w) external view returns (bytes32[] memory) {
+        return weekTheses[w];
+    }
+
+    function _bookWeekScore(address wallet, int256 delta) private {
+        uint32 w = _week();
+        int256 prev = weekScore[w][wallet];
+        int256 next = prev + delta;
+        weekScore[w][wallet] = next;
+        uint256 prevPos = prev > 0 ? uint256(prev) : 0;
+        uint256 nextPos = next > 0 ? uint256(next) : 0;
+        weekTotal[w] = weekTotal[w] + nextPos - prevPos;
+    }
+
+    /// @notice Moves ERC-20 IMD from the caller into the pools (the treasury's drip, or anyone's gift).
     function fundPot(uint256 amount) external {
         if (amount == 0) revert PotTooSmall();
         IERC20(imd).safeTransferFrom(msg.sender, address(this), amount);
         _unlock(ACT_FUND, address(0), amount, 0);
-        uint32 day = _today();
-        potImd[day] += amount;
-        emit PotFunded(day, amount, msg.sender);
+        _accrue(amount);
+        emit PotFunded(_today(), amount, msg.sender);
     }
 
-    /// @notice Converts forfeited MARG into IMD for today's pot. Judge-only so the timing is predictable.
+    /// @notice Converts forfeited MARG into IMD for the pools. Judge-only so the timing is predictable.
     function sellPotMarg(uint256 amount) external returns (uint256 imdOut) {
         if (msg.sender != address(judge)) revert Unauthorized();
         if (amount == 0 || amount > potMarg) revert PotTooSmall();
         potMarg -= amount;
         imdOut = _unlock(ACT_SELL, address(0), amount, 0);
-        uint32 day = _today();
-        potImd[day] += imdOut;
-        emit PotMargSold(amount, imdOut, day);
+        _accrue(imdOut);
+        emit PotMargSold(amount, imdOut, _today());
     }
 
-    /// @notice The judge draws the oracle's price out of a day's pot.
-    function drawForJudging(uint32 day, uint256 amount) external {
+    /// @notice The judge draws the oracle's price out of a week's thesis pool.
+    function drawForJudging(uint32 w, uint256 amount) external {
         if (msg.sender != address(judge)) revert Unauthorized();
-        if (potImd[day] < JUDGE_THRESHOLD || amount > potImd[day]) revert PotTooSmall();
-        potImd[day] -= amount;
+        if (thesisPool[w] < JUDGE_THRESHOLD || amount > thesisPool[w]) revert PotTooSmall();
+        thesisPool[w] -= amount;
         _unlock(ACT_PAY, address(judge), amount, uint256(uint160(imd)));
     }
 
-    /// @notice Who wrote a note and on which day: what the judge needs to filter the panel's ranking.
-    function noteMeta(bytes32 id) external view returns (address author, uint32 day) {
+    /// @notice Who wrote a note and in which week: what the judge needs to filter the panel's ranking.
+    function noteMeta(bytes32 id) external view returns (address author, uint32 w, bool thesis) {
         T.Note storage n = notes[id];
-        return (n.author, n.day);
+        return (n.author, uint32(uint256(n.postedAt) / 7 days), n.targetBps == 0);
     }
 
-    /// @notice Pays a judged day's pot 50/30/20 to the ranked authors. The judge supplies the verified ranking.
-    function payJudged(uint32 day, bytes32[3] calldata top) external {
+    /// @notice Pays a judged week's thesis pool 50/30/20 to the ranked authors. The judge supplies the ranking.
+    function payJudged(uint32 w, bytes32[3] calldata top) external {
         if (msg.sender != address(judge)) revert Unauthorized();
-        if (judgedPaid[day]) revert AlreadyPaid();
-        judgedPaid[day] = true;
-        uint256 pot = potImd[day];
-        potImd[day] = 0;
-        uint256[3] memory shares = [pot * 50 / 100, pot * 30 / 100, pot * 20 / 100];
+        if (judgedPaid[w]) revert AlreadyPaid();
+        judgedPaid[w] = true;
+        uint256 pool = thesisPool[w];
+        thesisPool[w] = 0;
+        uint256[3] memory shares = [pool * 50 / 100, pool * 30 / 100, pool * 20 / 100];
         uint256[3] memory paidAmounts;
-        uint256 leftover = pot;
-        for (uint256 i = 0; i < 3; ++i) {
-            if (top[i] == bytes32(0)) continue;
-            address to = notes[top[i]].author;
+        uint256 leftover = pool;
+        for (uint256 k = 0; k < 3; ++k) {
+            if (top[k] == bytes32(0)) continue;
+            address to = notes[top[k]].author;
             records[to].judgedWins += 1;
-            _unlock(ACT_PAY, to, shares[i], uint256(uint160(imd)));
-            paidAmounts[i] = shares[i];
-            leftover -= shares[i];
+            _unlock(ACT_PAY, to, shares[k], uint256(uint160(imd)));
+            paidAmounts[k] = shares[k];
+            leftover -= shares[k];
         }
-        if (leftover > 0) potImd[_today()] += leftover; // unranked slots roll forward
-        emit JudgedPaid(day, paidAmounts);
+        if (leftover > 0) thesisPool[_week()] += leftover; // unranked slots roll forward
+        emit JudgedPaid(w, paidAmounts);
+    }
+
+    /// @notice A wallet's share of a finished week's leaderboard pool: pro-rata by positive score, capped.
+    function leaderboardShare(uint32 w, address wallet) public view returns (uint256) {
+        int256 s = weekScore[w][wallet];
+        if (s <= 0 || weekTotal[w] == 0) return 0;
+        uint256 pool = leaderboardPool[w];
+        uint256 share = FullMath.mulDiv(pool, uint256(s), weekTotal[w]);
+        uint256 cap = pool * LEADERBOARD_CAP_BPS / 10_000;
+        return share > cap ? cap : share;
+    }
+
+    function claimLeaderboard(uint32 w) external {
+        if (w >= _week()) revert TooEarly();
+        if (leaderboardClaimed[w][msg.sender]) revert NothingToClaim();
+        uint256 amount = leaderboardShare(w, msg.sender);
+        if (amount == 0) revert NothingToClaim();
+        leaderboardClaimed[w][msg.sender] = true;
+        leaderboardSwept[w] += amount;
+        _unlock(ACT_PAY, msg.sender, amount, uint256(uint160(imd)));
+        emit LeaderboardClaimed(w, msg.sender, amount);
+    }
+
+    /// @notice A writer's refund: the day's pool split equally across its notes, at most one stamp each.
+    function claimRefund(bytes32 id) external {
+        T.Note storage n = _note(id);
+        if (msg.sender != n.author) revert Unauthorized();
+        if (n.day >= _today()) revert TooEarly();
+        if (refundClaimed[id] || n.status == T.Status.Retracted) revert NothingToClaim();
+        uint256 count = notesPerDay[n.day];
+        uint256 amount = refundPool[n.day] / count;
+        if (amount > STAMP) amount = STAMP;
+        if (amount == 0) revert NothingToClaim();
+        refundClaimed[id] = true;
+        refundPool[n.day] -= amount;
+        notesPerDay[n.day] = uint32(count - 1);
+        _unlock(ACT_PAY, msg.sender, amount, uint256(uint160(imd)));
+        emit RefundClaimed(id, msg.sender, amount);
+    }
+
+    /// @notice Rolls what a day's refund pool or a week's leaderboard pool left unclaimed into the current one.
+    function sweep(uint8 kind, uint32 epoch) external {
+        uint256 amount;
+        if (kind == 0) {
+            if (block.timestamp < (uint256(epoch) + 1) * 1 days + SWEEP_AFTER) revert TooEarly();
+            amount = refundPool[epoch];
+            refundPool[epoch] = 0;
+            refundPool[_today()] += amount;
+        } else {
+            if (block.timestamp < (uint256(epoch) + 1) * 7 days + SWEEP_AFTER) revert TooEarly();
+            amount = leaderboardPool[epoch] - leaderboardSwept[epoch];
+            leaderboardSwept[epoch] = leaderboardPool[epoch];
+            leaderboardPool[_week()] += amount;
+        }
+        if (amount == 0) revert NothingToSweep();
+        emit Swept(kind, epoch, amount);
     }
 
     // ------------------------------------------------------------------ unlock plumbing

@@ -14,6 +14,10 @@ contract LifecycleTest is Fixture {
         _setup();
     }
 
+    function _pot() internal view returns (uint256) {
+        return hook.refundPool(hook.today()) + hook.leaderboardPool(hook.week()) + hook.thesisPool(hook.week());
+    }
+
     function testFlagsAndBinding() public view {
         assertTrue(HookFlags.matches(address(hook), HookFlags.MARGINALIA));
         assertTrue(hook.initialized());
@@ -28,10 +32,10 @@ contract LifecycleTest is Fixture {
     }
 
     function testPlainBuyTakesNothing() public {
-        uint256 pot = hook.potImd(hook.today());
+        uint256 pot = _pot();
         uint256 out = _buy(alice, 10 ether);
         assertGt(out, 9 ether);
-        assertEq(hook.potImd(hook.today()), pot);
+        assertEq(_pot(), pot);
         assertEq(hook.noteCount(), 0);
     }
 
@@ -44,7 +48,7 @@ contract LifecycleTest is Fixture {
         assertEq(uint8(n.class), uint8(T.Class.Declared));
         assertApproxEqRel(n.deposit, 0.5 ether, 0.02e18); // ~0.5 IMD of MARG at ~1:1
         assertApproxEqRel(n.postPrice, 1e18, 0.02e18);
-        assertEq(hook.potImd(hook.today()), hook.STAMP());
+        assertEq(_pot(), hook.STAMP());
         assertEq(_claims(address(hook), address(imd)), hook.STAMP());
         assertEq(_claims(address(hook), address(token)), n.deposit);
         assertEq(token.balanceOf(alice) - margBefore, received);
@@ -66,9 +70,9 @@ contract LifecycleTest is Fixture {
     }
 
     function testQuietSellPaysThreePercent() public {
-        uint256 potBefore = hook.potImd(hook.today());
+        uint256 potBefore = _pot();
         uint256 out = _sell(bob, 100 ether);
-        uint256 fee = hook.potImd(hook.today()) - potBefore;
+        uint256 fee = _pot() - potBefore;
         // fee = 3% of what the pool paid out; the seller received pool output minus fee
         assertApproxEqRel(fee, (out + fee) * 300 / 10_000, 0.001e18);
         assertEq(_claims(address(hook), address(imd)), fee);
@@ -77,7 +81,7 @@ contract LifecycleTest is Fixture {
     function testNotedSellPaysOnePercentPlusStamp() public {
         vm.prank(bob);
         token.approve(address(router), type(uint256).max);
-        uint256 potBefore = hook.potImd(hook.today());
+        uint256 potBefore = _pot();
         uint256 claimsBefore = _claims(address(hook), address(token));
         T.NoteParams memory p = _margNote(T.Side.Sell, 7000, 14, "MARG -30%: airdrop supply still unwinding");
         vm.prank(bob);
@@ -88,13 +92,13 @@ contract LifecycleTest is Fixture {
         assertEq(uint8(n.side), uint8(T.Side.Sell));
         assertApproxEqRel(n.deposit, 0.5 ether, 0.02e18);
         assertEq(_claims(address(hook), address(token)) - claimsBefore, n.deposit);
-        uint256 taken = hook.potImd(hook.today()) - potBefore;
+        uint256 taken = _pot() - potBefore;
         // the pool paid out (out + taken); 1% of that plus the 0.1 stamp went to the pot
         assertApproxEqRel(taken - hook.STAMP(), (out + taken) * 100 / 10_000, 0.001e18);
         // cheaper than the quiet path on the same size
-        uint256 potMid = hook.potImd(hook.today());
+        uint256 potMid = _pot();
         _sell(bob, 100 ether);
-        uint256 quiet = hook.potImd(hook.today()) - potMid;
+        uint256 quiet = _pot() - potMid;
         assertGt(quiet, taken);
     }
 
@@ -218,33 +222,33 @@ contract LifecycleTest is Fixture {
     function testTreasuryDrip() public {
         imd.transfer(address(treasury), 1000 ether);
         treasury.drip();
-        assertEq(hook.potImd(hook.today()), 20 ether);
+        assertEq(_pot(), 20 ether);
         vm.expectRevert(MarginaliaHook.PotTooSmall.selector);
         hook.fundPot(0);
         vm.expectRevert();
         treasury.drip();
     }
 
-    function testJudgingFlow() public {
-        uint32 day = hook.today();
-        (bytes32 a1,) = _note(alice, _margNote(T.Side.Buy, 20_000, 7, "argued well"), 10 ether);
-        (bytes32 b1,) = _note(bob, _margNote(T.Side.Buy, 20_000, 7, "argued less well"), 10 ether);
+    function testWeeklyThesisJudging() public {
+        uint32 w = hook.week();
+        (bytes32 a1,) = _note(alice, _margNote(T.Side.Buy, 0, 0, "thesis A: cited, argued"), 10 ether);
+        (bytes32 b1,) = _note(bob, _margNote(T.Side.Buy, 0, 0, "thesis B: shorter"), 10 ether);
+        (bytes32 call1,) = _note(alice, _margNote(T.Side.Buy, 20_000, 7, "a short call, never judged"), 10 ether);
         vm.prank(alice);
-        hook.fundPot(5 ether);
-        assertEq(hook.notesOfDay(day).length, 2);
+        hook.fundPot(20 ether); // 30% of this lands in the thesis pool
+        assertEq(hook.thesesOfWeek(w).length, 2);
+        assertEq(hook.thesisPool(w), (20 ether + 3 * hook.STAMP()) * 30 / 100);
         vm.expectRevert();
-        judge.requestJudging(day); // day not over
-        vm.warp(block.timestamp + 1 days);
-        bytes32 reqId = judge.requestJudging(day);
+        judge.requestJudging(w); // week not over
+        vm.warp(block.timestamp + 7 days);
+        bytes32 reqId = judge.requestJudging(w);
         MockIntake intake = MockIntake(hook.INTAKE());
         assertEq(intake.requests(), 1);
         assertEq(intake.lastTarget(), address(judge));
-        assertEq(intake.lastSelector(), judge.onOracleResult.selector);
-        assertEq(hook.potImd(day), 5 ether + 2 * hook.STAMP() - 0.5 ether);
-        // The panel answers: bob first, then alice.
-        bytes32[] memory ranked = new bytes32[](2);
+        bytes32[] memory ranked = new bytes32[](3);
         ranked[0] = b1;
-        ranked[1] = a1;
+        ranked[1] = call1; // a short call in the ranking is ignored
+        ranked[2] = a1;
         OracleAttestation.Attestation memory att = OracleAttestation.Attestation({
             requestId: bytes32(uint256(0xabc)),
             chainId: block.chainid,
@@ -262,23 +266,91 @@ contract LifecycleTest is Fixture {
             issuedAt: uint64(block.timestamp),
             expiresAt: uint64(block.timestamp + 1 days)
         });
-        vm.prank(alice);
-        vm.expectRevert(MarginaliaJudge.OnlyIntake.selector);
-        judge.onOracleResult(reqId, att, hex"01");
         vm.prank(hook.INTAKE());
         judge.onOracleResult(reqId, att, hex"01");
-        assertTrue(judge.judgedSet(day));
-        uint256 pot = hook.potImd(day);
+        bytes32[3] memory top = judge.judgedOf(w);
+        assertEq(top[0], b1);
+        assertEq(top[1], a1);
+        assertEq(top[2], bytes32(0));
+        uint256 pool = hook.thesisPool(w);
         uint256 bobBefore = imd.balanceOf(bob);
         uint256 aliceBefore = imd.balanceOf(alice);
-        judge.payJudged(day);
-        assertEq(imd.balanceOf(bob) - bobBefore, pot * 50 / 100);
-        assertEq(imd.balanceOf(alice) - aliceBefore, pot * 30 / 100);
-        assertEq(hook.potImd(day), 0);
-        assertEq(hook.potImd(hook.today()), pot * 20 / 100); // the empty third slot rolls forward
-        assertEq(hook.recordOf(bob).judgedWins, 1);
-        vm.expectRevert(MarginaliaJudge.AlreadyPaid.selector);
-        judge.payJudged(day);
+        judge.payJudged(w);
+        assertEq(imd.balanceOf(bob) - bobBefore, pool * 50 / 100);
+        assertEq(imd.balanceOf(alice) - aliceBefore, pool * 30 / 100);
+        assertEq(hook.thesisPool(w), 0);
+        assertEq(hook.thesisPool(hook.week()), pool * 20 / 100);
+    }
+
+    function testLeaderboardProRataWithCap() public {
+        uint32 w = hook.week();
+        // alice: a right +10% call; bob: a wrong +50% call; carol: nothing
+        (bytes32 a,) = _note(alice, _margNote(T.Side.Buy, 11_000, 1, "+10%"), 10 ether);
+        (bytes32 b,) = _note(bob, _margNote(T.Side.Buy, 15_000, 1, "+50%"), 10 ether);
+        vm.prank(alice);
+        hook.fundPot(100 ether);
+        _buy(bob, 1_500_000 ether);
+        vm.warp(hook.horizonEnd(a));
+        uint256 startBlock = block.number;
+        for (uint256 i = 0; i < 3; ++i) {
+            hook.observe(a);
+            hook.observe(b);
+            vm.roll(startBlock + 25 * (i + 1));
+        }
+        vm.warp(hook.horizonEnd(a) + hook.SETTLE_WINDOW() + 1);
+        hook.settle(a);
+        hook.settle(b);
+        assertGt(hook.weekScore(w, alice), 0);
+        assertLt(hook.weekScore(w, bob), 0);
+        assertEq(hook.weekTotal(w), uint256(hook.weekScore(w, alice)));
+        uint256 pool = hook.leaderboardPool(w);
+        assertGt(pool, 0);
+        // alice is the only positive scorer: pro-rata would be 100%, the cap holds her to 10%
+        assertEq(hook.leaderboardShare(w, alice), pool * 10 / 100);
+        assertEq(hook.leaderboardShare(w, bob), 0);
+        vm.prank(alice);
+        vm.expectRevert(MarginaliaHook.TooEarly.selector);
+        hook.claimLeaderboard(w);
+        vm.warp((uint256(w) + 1) * 7 days + 1);
+        uint256 before = imd.balanceOf(alice);
+        vm.prank(alice);
+        hook.claimLeaderboard(w);
+        assertEq(imd.balanceOf(alice) - before, pool * 10 / 100);
+        vm.prank(alice);
+        vm.expectRevert(MarginaliaHook.NothingToClaim.selector);
+        hook.claimLeaderboard(w);
+        // the unclaimed 90% rolls forward after the sweep delay
+        vm.expectRevert(MarginaliaHook.TooEarly.selector);
+        hook.sweep(1, w);
+        vm.warp(block.timestamp + hook.SWEEP_AFTER());
+        hook.sweep(1, w);
+        assertEq(hook.leaderboardPool(hook.week()), pool - pool * 10 / 100);
+    }
+
+    function testWriterRefundCappedAtStamp() public {
+        uint32 day = hook.today();
+        (bytes32 a,) = _note(alice, _margNote(T.Side.Buy, 20_000, 7, "A"), 10 ether);
+        (bytes32 b,) = _note(bob, _margNote(T.Side.Buy, 20_000, 7, "B"), 10 ether);
+        vm.prank(alice);
+        hook.fundPot(50 ether); // 20% = 10 IMD into today's refund pool: plenty, so the cap binds
+        assertEq(hook.notesPerDay(day), 2);
+        vm.prank(alice);
+        vm.expectRevert(MarginaliaHook.TooEarly.selector);
+        hook.claimRefund(a);
+        vm.warp(block.timestamp + 1 days);
+        uint256 before = imd.balanceOf(alice);
+        vm.prank(alice);
+        hook.claimRefund(a);
+        assertEq(imd.balanceOf(alice) - before, hook.STAMP());
+        vm.prank(alice);
+        vm.expectRevert(MarginaliaHook.NothingToClaim.selector);
+        hook.claimRefund(a);
+        // a retracted note cannot claim
+        vm.prank(bob);
+        hook.retract(b, "changed my mind");
+        vm.prank(bob);
+        vm.expectRevert(MarginaliaHook.NothingToClaim.selector);
+        hook.claimRefund(b);
     }
 
     function testForfeitsConvertToImdForThePot() public {
@@ -287,11 +359,11 @@ contract LifecycleTest is Fixture {
         hook.retract(id, "out");
         uint256 marg = hook.potMarg();
         assertGt(marg, 0);
-        uint256 potBefore = hook.potImd(hook.today());
+        uint256 potBefore = _pot();
         uint256 out = judge.convertForfeits();
         assertGt(out, 0);
         assertEq(hook.potMarg(), 0);
-        assertEq(hook.potImd(hook.today()) - potBefore, out);
+        assertEq(_pot() - potBefore, out);
         assertEq(_claims(address(hook), address(token)), 0);
     }
 }
