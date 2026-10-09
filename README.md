@@ -42,7 +42,7 @@ single-sided; the swarm's 10% goes to the launch's distributor.
 ## v1 scope and known limits
 
 - Price adapters assume 18-decimal assets on both sides. Quotes other than IMD, ETH or WETH are refused.
-- Sells of MARG always pay the 3% quiet fee in v1 (the 1% noted-sell discount is specified, not built).
+- Sells of MARG pay 3% through any router, or 1% plus the stamp through `sellWithNote` with a note and deposit attached.
 - The X trade leg supports v4 pools (including native-ETH pairs), v3 pools and v2 pairs; exact-input only.
 - The hook's initcode embeds its three companions and must stay under EIP-3860's 49,152 bytes; `forge build --sizes` is the gate (the fork test does not enforce it).
 - The action fee on follow trades, treasury conversion of ETH/USDC/USDT to IMD, the on-chain ERC-8004 agent

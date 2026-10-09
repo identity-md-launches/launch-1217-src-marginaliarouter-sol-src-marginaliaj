@@ -40,6 +40,7 @@ contract MarginaliaHook is IUnlockCallback {
 
     uint256 public constant STAMP = 0.1 ether; // IMD-equivalent, non-refundable, to the pot
     uint256 public constant DEPOSIT = 0.5 ether; // IMD-equivalent of MARG, refundable
+    uint256 public constant SELL_NOTED_BPS = 100;
     uint256 public constant SELL_QUIET_BPS = 300;
     uint32 public constant MIN_TARGET_DELTA_BPS = 1000;
     uint16 public constant MAX_HORIZON_DAYS = 90;
@@ -113,6 +114,7 @@ contract MarginaliaHook is IUnlockCallback {
     // ------------------------------------------------------------------ transient-ish scratch
 
     bytes32 private unlockHash;
+    uint256 private pendingSellDeposit;
 
     uint8 private constant ACT_PAY = 1; // burn claims, take currency to `to`
     uint8 private constant ACT_FUND = 2; // move ERC-20 IMD into claims
@@ -257,6 +259,14 @@ contract MarginaliaHook is IUnlockCallback {
                 if (uint256(-params.amountSpecified) <= STAMP * 2) revert NoteTooSmall();
                 specifiedTake = STAMP;
             }
+        } else if (kind == T.DATA_NOTE) {
+            // A noted sell: the deposit is MARG taken off the specified input; the 1% fee and stamp come
+            // off the IMD output in afterSwap. Exact input only.
+            if (params.amountSpecified >= 0) revert NoteNeedsExactInput();
+            uint256 depositMarg = FullMath.mulDiv(DEPOSIT, 1e18, margPriceInImd());
+            if (uint256(-params.amountSpecified) <= depositMarg * 2) revert NoteTooSmall();
+            pendingSellDeposit = depositMarg;
+            specifiedTake = depositMarg;
         } else if (kind != T.DATA_EXEMPT && params.amountSpecified > 0) {
             // Exact-output IMD sell: gross the quiet fee up so the requested output is net of it.
             uint256 bps = SELL_QUIET_BPS;
@@ -298,6 +308,20 @@ contract MarginaliaHook is IUnlockCallback {
         }
 
         if (kind == T.DATA_EXEMPT) return (IHooks.afterSwap.selector, 0);
+
+        if (kind == T.DATA_NOTE) {
+            uint256 depositMarg = pendingSellDeposit;
+            delete pendingSellDeposit;
+            uint256 fee = poolImd * SELL_NOTED_BPS / 10_000 + STAMP;
+            if (poolImd <= fee) revert NoteTooSmall();
+            poolManager.mint(address(this), _id(imd), fee);
+            poolManager.mint(address(this), _id(token), depositMarg);
+            potImd[day] += fee;
+            (T.NoteParams memory p, address author, uint256 xResult) = _decodeNote(data);
+            _postNote(author, p, xResult, depositMarg);
+            emit SwapFee(false, author, poolImd, fee - STAMP, STAMP);
+            return (IHooks.afterSwap.selector, fee.toInt128());
+        }
 
         // Quiet sell.
         uint256 quietFee;

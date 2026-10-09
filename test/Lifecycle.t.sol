@@ -74,6 +74,30 @@ contract LifecycleTest is Fixture {
         assertEq(_claims(address(hook), address(imd)), fee);
     }
 
+    function testNotedSellPaysOnePercentPlusStamp() public {
+        vm.prank(bob);
+        token.approve(address(router), type(uint256).max);
+        uint256 potBefore = hook.potImd(hook.today());
+        uint256 claimsBefore = _claims(address(hook), address(token));
+        T.NoteParams memory p = _margNote(T.Side.Sell, 7000, 14, "MARG -30%: airdrop supply still unwinding");
+        vm.prank(bob);
+        uint256 out = router.sellWithNote(p, 100 ether, 1, block.timestamp + 1);
+        bytes32 id = bytes32(hook.noteCount());
+        T.Note memory n = hook.noteOf(id);
+        assertEq(n.author, bob);
+        assertEq(uint8(n.side), uint8(T.Side.Sell));
+        assertApproxEqRel(n.deposit, 0.5 ether, 0.02e18);
+        assertEq(_claims(address(hook), address(token)) - claimsBefore, n.deposit);
+        uint256 taken = hook.potImd(hook.today()) - potBefore;
+        // the pool paid out (out + taken); 1% of that plus the 0.1 stamp went to the pot
+        assertApproxEqRel(taken - hook.STAMP(), (out + taken) * 100 / 10_000, 0.001e18);
+        // cheaper than the quiet path on the same size
+        uint256 potMid = hook.potImd(hook.today());
+        _sell(bob, 100 ether);
+        uint256 quiet = hook.potImd(hook.today()) - potMid;
+        assertGt(quiet, taken);
+    }
+
     function testRightCallReturnsDepositAsImd() public {
         (bytes32 id,) = _note(alice, _margNote(T.Side.Buy, 11_000, 1, "+10% in a day: the airdrop sells are done"), 10 ether);
         // bob pushes the price up more than 10%

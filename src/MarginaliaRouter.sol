@@ -62,7 +62,7 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
 
     struct Job {
         address payer;
-        uint8 kind; // 1 noted buy (the only kind the router issues)
+        bool sellMarg; // false: buy MARG with IMD and note; true: sell MARG for IMD and note (the 1% path)
         uint256 amountIn;
         uint256 minOut;
         XTrade x;
@@ -81,7 +81,7 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
     error Expired();
     error NoteTokenMismatch();
 
-    event Noted(address indexed author, uint256 imdSpent, uint256 margReceived);
+    event Noted(address indexed author, bool sellMarg, uint256 spent, uint256 received);
     event XTraded(address indexed trader, uint8 kind, address indexed xIn, address indexed xOut, uint256 spent, uint256 received);
 
     constructor(IPoolManager manager_, address hook_) {
@@ -99,7 +99,18 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
         returns (uint256)
     {
         XTrade memory noX;
-        return _run(1, imdIn, minMargOut, deadline, noX, p);
+        return _run(false, imdIn, minMargOut, deadline, noX, p);
+    }
+
+    /// @notice Sell MARG with a note attached: 1% plus the stamp instead of the quiet 3%, and the deposit
+    /// comes off the MARG sold. The note may be about any token (a SELL call on MARG itself is the natural one).
+    function sellWithNote(T.NoteParams calldata p, uint256 margIn, uint256 minImdOut, uint256 deadline)
+        external
+        nonReentrant
+        returns (uint256)
+    {
+        XTrade memory noX;
+        return _run(true, margIn, minImdOut, deadline, noX, p);
     }
 
     /// @notice Trade X (v4, v3 or v2) and post the note about it in one transaction (class Traded).
@@ -109,22 +120,22 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
         returns (uint256)
     {
         if (x.kind == X_NONE) revert InvalidSwap();
-        return _run(1, imdIn, minMargOut, deadline, x, p);
+        return _run(false, imdIn, minMargOut, deadline, x, p);
     }
 
     // ------------------------------------------------------------------ core
 
-    function _run(uint8 kind, uint256 amountIn, uint256 minOut, uint256 deadline, XTrade memory x, T.NoteParams memory p)
+    function _run(bool sellMarg, uint256 amountIn, uint256 minOut, uint256 deadline, XTrade memory x, T.NoteParams memory p)
         private
         returns (uint256 received)
     {
         if (block.timestamp > deadline) revert Expired();
         if (amountIn == 0 || amountIn > uint256(uint128(type(int128).max))) revert InvalidSwap();
-        IERC20(hook.imd()).safeTransferFrom(msg.sender, address(this), amountIn);
+        IERC20(sellMarg ? hook.token() : hook.imd()).safeTransferFrom(msg.sender, address(this), amountIn);
 
         Job memory job;
         job.payer = msg.sender;
-        job.kind = kind;
+        job.sellMarg = sellMarg;
         job.amountIn = amountIn;
         job.minOut = minOut;
         job.x = x;
@@ -169,7 +180,7 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
         PoolKey memory key = hook.getPoolKey();
         address imd = hook.imd();
         bool imd0 = Currency.unwrap(key.currency0) == imd;
-        bool zeroForOne = imd0; // IMD in, MARG out
+        bool zeroForOne = job.sellMarg ? !imd0 : imd0; // IMD in / MARG out, or the reverse
         bytes memory hookData = abi.encode(T.DATA_NOTE, job.note, job.payer, job.xResult);
 
         BalanceDelta delta = manager.swap(
@@ -188,7 +199,7 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
         _pay(payCurrency, spent);
         manager.take(receiveCurrency, job.payer, received);
         if (spent < job.amountIn) IERC20(Currency.unwrap(payCurrency)).safeTransfer(job.payer, job.amountIn - spent);
-        emit Noted(job.payer, spent, received);
+        emit Noted(job.payer, job.sellMarg, spent, received);
         return abi.encode(received);
     }
 
