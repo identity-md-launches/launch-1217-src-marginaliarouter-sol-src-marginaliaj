@@ -9,7 +9,8 @@ import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.s
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
-import {ModifyLiquidityParams} from "v4-core/src/types/PoolOperation.sol";
+import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -53,6 +54,42 @@ contract LiquidityHelper is IUnlockCallback {
         } else if (d > 0) {
             manager.take(c, address(this), uint256(uint128(d)));
         }
+    }
+}
+
+/// @dev Any v4 router can buy or sell MARG; this is the test's plain one (no notes).
+contract TestSwapRouter is IUnlockCallback {
+    using SafeERC20 for IERC20;
+
+    IPoolManager public immutable manager;
+
+    constructor(IPoolManager m) {
+        manager = m;
+    }
+
+    function swap(PoolKey memory key, bool zeroForOne, uint256 amountIn, address payer) external returns (uint256 received) {
+        return abi.decode(manager.unlock(abi.encode(key, zeroForOne, amountIn, payer)), (uint256));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager));
+        (PoolKey memory key, bool zeroForOne, uint256 amountIn, address payer) =
+            abi.decode(data, (PoolKey, bool, uint256, address));
+        BalanceDelta d = manager.swap(
+            key,
+            SwapParams(zeroForOne, -int256(amountIn), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1),
+            ""
+        );
+        int128 inD = zeroForOne ? d.amount0() : d.amount1();
+        int128 outD = zeroForOne ? d.amount1() : d.amount0();
+        require(inD < 0 && outD > 0, "bad swap");
+        Currency pay = zeroForOne ? key.currency0 : key.currency1;
+        Currency recv = zeroForOne ? key.currency1 : key.currency0;
+        manager.sync(pay);
+        IERC20(Currency.unwrap(pay)).safeTransferFrom(payer, address(manager), uint256(-int256(inD)));
+        manager.settle();
+        manager.take(recv, payer, uint256(uint128(outD)));
+        return abi.encode(uint256(uint128(outD)));
     }
 }
 
@@ -103,6 +140,7 @@ abstract contract Fixture is Test {
     PoolKey internal key;
     PoolId internal poolId;
     LiquidityHelper internal liquidity;
+    TestSwapRouter internal plain;
     bool internal margIs0;
     address internal alice = makeAddr("alice");
     address internal bob = makeAddr("bob");
@@ -143,6 +181,7 @@ abstract contract Fixture is Test {
         poolId = key.toId();
         manager.initialize(key, uint160(1 << 96));
         liquidity = new LiquidityHelper(manager);
+        plain = new TestSwapRouter(manager);
         token.transfer(address(liquidity), 50_000_000 ether);
         imd.transfer(address(liquidity), 50_000_000 ether);
         liquidity.add(key, -6000, 6000, 10_000_000 ether);
@@ -152,12 +191,14 @@ abstract contract Fixture is Test {
         token.transfer(bob, 100_000 ether);
         vm.startPrank(alice);
         imd.approve(address(router), type(uint256).max);
-        token.approve(address(router), type(uint256).max);
+        imd.approve(address(plain), type(uint256).max);
+        token.approve(address(plain), type(uint256).max);
         imd.approve(address(hook), type(uint256).max);
         vm.stopPrank();
         vm.startPrank(bob);
         imd.approve(address(router), type(uint256).max);
-        token.approve(address(router), type(uint256).max);
+        imd.approve(address(plain), type(uint256).max);
+        token.approve(address(plain), type(uint256).max);
         vm.stopPrank();
         // The oracle stand-ins live at the hook's hardcoded mainnet addresses.
         vm.etch(hook.INTAKE(), address(new MockIntake()).code);
@@ -185,13 +226,11 @@ abstract contract Fixture is Test {
     }
 
     function _buy(address who, uint256 imdIn) internal returns (uint256 received) {
-        vm.prank(who);
-        received = router.buy(imdIn, 1, block.timestamp + 1);
+        received = plain.swap(key, !margIs0, imdIn, who); // IMD in
     }
 
     function _sell(address who, uint256 margIn) internal returns (uint256 received) {
-        vm.prank(who);
-        received = router.sell(margIn, 1, block.timestamp + 1);
+        received = plain.swap(key, margIs0, margIn, who); // MARG in
     }
 
     function _claims(address holder, address currency) internal view returns (uint256) {

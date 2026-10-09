@@ -174,7 +174,8 @@ contract MainnetLaunchTest is Test {
         IERC20(IMD).approve(address(router), type(uint256).max);
         PoolKey memory hub = PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), 10000, 200, IHooks(address(0)));
         assertEq(PoolId.unwrap(hub.toId()), hook.HUB_POOL_ID(), "hub key");
-        MarginaliaRouter.XTrade memory x = MarginaliaRouter.XTrade(hub, false, 10 ether, 1); // sell IMD for ETH
+        MarginaliaRouter.XTrade memory x =
+            MarginaliaRouter.XTrade(router.X_V4(), hub, false, address(0), IMD, 10 ether, 1); // sell IMD for ETH
         T.NoteParams memory p;
         p.x = IMD;
         p.venue = T.Venue(T.VenueKind.UniV4, hook.HUB_POOL_ID(), address(0), false);
@@ -194,6 +195,86 @@ contract MainnetLaunchTest is Test {
         // a traded note about a token other than the one traded is refused
         p.x = address(token);
         p.venue = T.Venue(T.VenueKind.UniV4, PoolId.unwrap(key.toId()), IMD, address(token) < IMD);
+        vm.startPrank(alice);
+        vm.expectRevert(MarginaliaRouter.NoteTokenMismatch.selector);
+        router.tradeAndNote(x, p, 5 ether, 1, block.timestamp + 1);
+        vm.stopPrank();
+    }
+
+    address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address constant LINK = 0x514910771AF9Ca656af840dff83E8264EcF986CA;
+    address constant UNI = 0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984;
+
+    function _xNote(address xToken, T.Venue memory venue, uint32 targetBps, uint16 horizon, string memory text)
+        internal
+        pure
+        returns (T.NoteParams memory p)
+    {
+        p.x = xToken;
+        p.venue = venue;
+        p.side = T.Side.Buy;
+        p.targetBps = targetBps;
+        p.horizonDays = horizon;
+        p.class = uint8(T.Class.Declared);
+        p.text = text;
+    }
+
+    /// @dev Buy LINK with WETH on the live Uniswap v3 LINK/WETH 0.3% pool and post the call in one tx.
+    function testTradeAndNoteOnUniswapV3() public {
+        _launch();
+        address v3Pool = 0xa6Cc3C2531FdaA6Ae1A3CA84c2855806728693e8;
+        deal(IMD, alice, 1000 ether);
+        deal(WETH, alice, 5 ether);
+        vm.startPrank(alice);
+        IERC20(IMD).approve(address(router), type(uint256).max);
+        IERC20(WETH).approve(address(router), type(uint256).max);
+        PoolKey memory noKey;
+        MarginaliaRouter.XTrade memory x = MarginaliaRouter.XTrade(router.X_V3(), noKey, false, v3Pool, WETH, 1 ether, 1);
+        T.NoteParams memory p = _xNote(
+            LINK,
+            T.Venue(T.VenueKind.UniV3, bytes32(uint256(uint160(v3Pool))), WETH, LINK < WETH),
+            15_000,
+            30,
+            "LINK 1.5x in 30d: CCIP volume"
+        );
+        uint256 linkBefore = IERC20(LINK).balanceOf(alice);
+        router.tradeAndNote(x, p, 5 ether, 1, block.timestamp + 1);
+        vm.stopPrank();
+        T.Note memory n = hook.noteOf(bytes32(hook.noteCount()));
+        assertGt(IERC20(LINK).balanceOf(alice), linkBefore, "bought LINK");
+        assertEq(uint8(n.class), uint8(T.Class.Traded));
+        assertEq(n.x, LINK);
+        assertEq(n.postBalance, IERC20(LINK).balanceOf(alice));
+        assertGt(n.postPrice, 0);
+        emit log_named_uint("LINK price in IMD (1e18)", n.postPrice);
+        assertEq(IERC20(WETH).balanceOf(address(router)), 0, "router holds nothing");
+    }
+
+    /// @dev Buy UNI with WETH on the live Uniswap v2 UNI/WETH pair and post the call in one tx.
+    function testTradeAndNoteOnUniswapV2() public {
+        _launch();
+        address pair = 0xd3d2E2692501A5c9Ca623199D38826e513033a17;
+        deal(IMD, alice, 1000 ether);
+        deal(WETH, alice, 5 ether);
+        vm.startPrank(alice);
+        IERC20(IMD).approve(address(router), type(uint256).max);
+        IERC20(WETH).approve(address(router), type(uint256).max);
+        PoolKey memory noKey;
+        MarginaliaRouter.XTrade memory x = MarginaliaRouter.XTrade(router.X_V2(), noKey, false, pair, WETH, 1 ether, 1);
+        T.NoteParams memory p = _xNote(
+            UNI, T.Venue(T.VenueKind.UniV2, bytes32(uint256(uint160(pair))), WETH, UNI < WETH), 12_000, 14, "UNI +20% in 14d: fee switch"
+        );
+        uint256 uniBefore = IERC20(UNI).balanceOf(alice);
+        router.tradeAndNote(x, p, 5 ether, 1, block.timestamp + 1);
+        vm.stopPrank();
+        T.Note memory n = hook.noteOf(bytes32(hook.noteCount()));
+        assertGt(IERC20(UNI).balanceOf(alice), uniBefore, "bought UNI");
+        assertEq(uint8(n.class), uint8(T.Class.Traded));
+        assertEq(n.x, UNI);
+        assertGt(n.postPrice, 0);
+        emit log_named_uint("UNI price in IMD (1e18)", n.postPrice);
+        // the wrong subject is refused on the v2 path too
+        p.x = LINK;
         vm.startPrank(alice);
         vm.expectRevert(MarginaliaRouter.NoteTokenMismatch.selector);
         router.tradeAndNote(x, p, 5 ether, 1, block.timestamp + 1);
@@ -226,12 +307,5 @@ contract MainnetLaunchTest is Test {
         emit log_named_uint("MARG received for 20 IMD", received);
         emit log_named_uint("deposit (MARG)", n.deposit);
         emit log_named_uint("post price of IMD in IMD (1e18)", n.postPrice);
-        // a quiet sell of half pays 3% to the pot
-        uint256 potBefore = hook.potImd(hook.today());
-        vm.startPrank(alice);
-        token.approve(address(router), type(uint256).max);
-        router.sell(received / 2, 1, block.timestamp + 1);
-        vm.stopPrank();
-        assertGt(hook.potImd(hook.today()), potBefore);
     }
 }

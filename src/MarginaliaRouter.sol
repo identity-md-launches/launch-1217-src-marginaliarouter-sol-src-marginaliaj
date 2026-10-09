@@ -19,33 +19,61 @@ interface IMarginaliaHook {
     function token() external view returns (address);
 }
 
-/// @notice The only path that can attach a note to a MARG swap. Funds are pulled only from msg.sender,
-/// never held between transactions. Optionally executes a trade of X on a Uniswap v4 pool in the same
-/// transaction, so the note's position is proven rather than claimed.
+interface IUniswapV3PoolSwap {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96, bytes calldata data)
+        external
+        returns (int256 amount0, int256 amount1);
+}
+
+interface IUniswapV2PairSwap {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+    function getReserves() external view returns (uint112 reserve0, uint112 reserve1, uint32);
+    function swap(uint256 amount0Out, uint256 amount1Out, address to, bytes calldata data) external;
+}
+
+/// @notice The only path that can attach a note to a MARG swap (plain buys and sells of MARG work through any
+/// v4 router; the hook taxes sells wherever they come from). Funds are pulled only from msg.sender and
+/// never held between transactions. Optionally trades X in the same transaction, on Uniswap v4, v3 or v2,
+/// so the note's position is proven rather than claimed. The note must be about the token traded.
 contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     IPoolManager public immutable manager;
     IMarginaliaHook public immutable hook;
 
+    uint8 public constant X_NONE = 0;
+    uint8 public constant X_V4 = 1;
+    uint8 public constant X_V3 = 2;
+    uint8 public constant X_V2 = 3;
+
+    /// @dev One X trade. v4 uses `key` + `zeroForOne`; v3 and v2 use `pool` + `tokenIn` (the pool decides the rest).
     struct XTrade {
+        uint8 kind;
         PoolKey key;
         bool zeroForOne;
+        address pool;
+        address tokenIn;
         uint256 amountIn;
         uint256 minOut;
     }
 
     struct Job {
         address payer;
-        uint8 kind; // 0 plain buy, 1 noted buy, 2 quiet sell, 3 noted sell (X = MARG)
+        uint8 kind; // 1 noted buy (the only kind the router issues)
         uint256 amountIn;
         uint256 minOut;
-        bool hasX;
         XTrade x;
+        uint256 xResult; // set before unlock for v3/v2 legs
+        address xIn;
+        address xOut;
         T.NoteParams note;
     }
 
     bytes32 private jobHash;
+    address private v3Pending;
 
     error UnauthorizedCallback();
     error InvalidSwap();
@@ -53,8 +81,8 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
     error Expired();
     error NoteTokenMismatch();
 
-    event Swapped(address indexed trader, bool buy, uint256 spent, uint256 received, bool noted);
-    event XTraded(address indexed trader, address indexed xIn, address indexed xOut, uint256 spent, uint256 received);
+    event Noted(address indexed author, uint256 imdSpent, uint256 margReceived);
+    event XTraded(address indexed trader, uint8 kind, address indexed xIn, address indexed xOut, uint256 spent, uint256 received);
 
     constructor(IPoolManager manager_, address hook_) {
         require(address(manager_).code.length > 0 && hook_ != address(0), "configuration required");
@@ -62,73 +90,69 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
         hook = IMarginaliaHook(hook_);
     }
 
-    /// @notice Buy MARG with IMD (exact input). With a note, the stamp and deposit come off the swap.
-    function buy(uint256 imdIn, uint256 minMargOut, uint256 deadline) external nonReentrant returns (uint256 received) {
-        T.NoteParams memory none;
-        return _run(0, imdIn, minMargOut, deadline, false, _emptyX(), none);
-    }
+    // ------------------------------------------------------------------ entry points
 
     /// @notice Post a note by buying MARG. Class is Declared unless the author is a contract (Agent).
     function note(T.NoteParams calldata p, uint256 imdIn, uint256 minMargOut, uint256 deadline)
         external
         nonReentrant
-        returns (uint256 received)
+        returns (uint256)
     {
-        return _run(1, imdIn, minMargOut, deadline, false, _emptyX(), p);
+        XTrade memory noX;
+        return _run(1, imdIn, minMargOut, deadline, noX, p);
     }
 
-    /// @notice Trade X on a v4 pool and post the note about it in one transaction (class Traded).
-    function tradeAndNote(
-        XTrade calldata x,
-        T.NoteParams calldata p,
-        uint256 imdIn,
-        uint256 minMargOut,
-        uint256 deadline
-    ) external nonReentrant returns (uint256 received) {
-        return _run(1, imdIn, minMargOut, deadline, true, x, p);
-    }
-
-    /// @notice Sell MARG for IMD (exact input). Quiet sells pay the 3% fee.
-    function sell(uint256 margIn, uint256 minImdOut, uint256 deadline) external nonReentrant returns (uint256 received) {
-        T.NoteParams memory none;
-        return _run(2, margIn, minImdOut, deadline, false, _emptyX(), none);
-    }
-
-    /// @notice Sell MARG with a SELL note on MARG itself: 1% fee plus the stamp, and a deposit off the input.
-    function sellWithNote(T.NoteParams calldata p, uint256 margIn, uint256 minImdOut, uint256 deadline)
+    /// @notice Trade X (v4, v3 or v2) and post the note about it in one transaction (class Traded).
+    function tradeAndNote(XTrade calldata x, T.NoteParams calldata p, uint256 imdIn, uint256 minMargOut, uint256 deadline)
         external
         nonReentrant
-        returns (uint256 received)
+        returns (uint256)
     {
-        return _run(3, margIn, minImdOut, deadline, false, _emptyX(), p);
+        if (x.kind == X_NONE) revert InvalidSwap();
+        return _run(1, imdIn, minMargOut, deadline, x, p);
     }
 
-    function _emptyX() private pure returns (XTrade memory x) {}
+    // ------------------------------------------------------------------ core
 
-    function _run(
-        uint8 kind,
-        uint256 amountIn,
-        uint256 minOut,
-        uint256 deadline,
-        bool hasX,
-        XTrade memory x,
-        T.NoteParams memory p
-    ) private returns (uint256 received) {
+    function _run(uint8 kind, uint256 amountIn, uint256 minOut, uint256 deadline, XTrade memory x, T.NoteParams memory p)
+        private
+        returns (uint256 received)
+    {
         if (block.timestamp > deadline) revert Expired();
         if (amountIn == 0 || amountIn > uint256(uint128(type(int128).max))) revert InvalidSwap();
-        bool isBuy = kind == 0 || kind == 1;
-        address input = isBuy ? hook.imd() : hook.token();
-        IERC20(input).safeTransferFrom(msg.sender, address(this), amountIn);
-        if (hasX) {
-            address xIn = Currency.unwrap(x.zeroForOne ? x.key.currency0 : x.key.currency1);
-            if (xIn == address(0) || x.amountIn == 0) revert InvalidSwap();
-            IERC20(xIn).safeTransferFrom(msg.sender, address(this), x.amountIn);
+        IERC20(hook.imd()).safeTransferFrom(msg.sender, address(this), amountIn);
+
+        Job memory job;
+        job.payer = msg.sender;
+        job.kind = kind;
+        job.amountIn = amountIn;
+        job.minOut = minOut;
+        job.x = x;
+        job.note = p;
+
+        if (x.kind != X_NONE) {
+            if (x.amountIn == 0) revert InvalidSwap();
+            if (x.kind == X_V4) {
+                address xIn = Currency.unwrap(x.zeroForOne ? x.key.currency0 : x.key.currency1);
+                if (xIn == address(0)) revert InvalidSwap();
+                IERC20(xIn).safeTransferFrom(msg.sender, address(this), x.amountIn);
+                // traded inside the unlock
+            } else {
+                IERC20(x.tokenIn).safeTransferFrom(msg.sender, address(this), x.amountIn);
+                (job.xResult, job.xIn, job.xOut) = x.kind == X_V3 ? _tradeV3(msg.sender, x) : _tradeV2(msg.sender, x);
+                _checkSubject(job);
+            }
         }
-        Job memory job = Job(msg.sender, kind, amountIn, minOut, hasX, x, p);
+
         bytes memory data = abi.encode(job);
         jobHash = keccak256(data);
         received = abi.decode(manager.unlock(data), (uint256));
         delete jobHash;
+    }
+
+    function _checkSubject(Job memory job) private pure {
+        address subject = job.note.side == T.Side.Buy ? job.xOut : job.xIn;
+        if (subject != job.note.x) revert NoteTokenMismatch();
     }
 
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
@@ -137,30 +161,20 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
         }
         delete jobHash;
         Job memory job = abi.decode(data, (Job));
-        uint256 xResult;
-        if (job.hasX) {
-            address xIn;
-            address xOut;
-            (xResult, xIn, xOut) = _tradeX(job.payer, job.x);
-            // A traded note must be about the token actually traded: bought for a BUY call, sold for a SELL call.
-            address subject = job.note.side == T.Side.Buy ? xOut : xIn;
-            if (subject != job.note.x) revert NoteTokenMismatch();
+        if (job.x.kind == X_V4) {
+            (job.xResult, job.xIn, job.xOut) = _tradeV4(job.payer, job.x);
+            _checkSubject(job);
         }
 
         PoolKey memory key = hook.getPoolKey();
         address imd = hook.imd();
         bool imd0 = Currency.unwrap(key.currency0) == imd;
-        bool isBuy = job.kind == 0 || job.kind == 1;
-        bool zeroForOne = isBuy == imd0;
-        bytes memory hookData;
-        if (job.kind == 1) hookData = abi.encode(T.DATA_NOTE, job.note, job.payer, xResult);
-        else if (job.kind == 3) hookData = abi.encode(T.DATA_SELL_NOTE, job.note, job.payer, uint256(0));
+        bool zeroForOne = imd0; // IMD in, MARG out
+        bytes memory hookData = abi.encode(T.DATA_NOTE, job.note, job.payer, job.xResult);
 
         BalanceDelta delta = manager.swap(
             key,
-            SwapParams(
-                zeroForOne, -int256(job.amountIn), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
-            ),
+            SwapParams(zeroForOne, -int256(job.amountIn), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1),
             hookData
         );
         int128 inputDelta = zeroForOne ? delta.amount0() : delta.amount1();
@@ -174,18 +188,16 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
         _pay(payCurrency, spent);
         manager.take(receiveCurrency, job.payer, received);
         if (spent < job.amountIn) IERC20(Currency.unwrap(payCurrency)).safeTransfer(job.payer, job.amountIn - spent);
-        emit Swapped(job.payer, isBuy, spent, received, job.kind == 1 || job.kind == 3);
+        emit Noted(job.payer, spent, received);
         return abi.encode(received);
     }
 
-    function _tradeX(address payer, XTrade memory x) private returns (uint256 received, address xIn, address xOut) {
+    // ------------------------------------------------------------------ X legs
+
+    function _tradeV4(address payer, XTrade memory x) private returns (uint256 received, address xIn, address xOut) {
         BalanceDelta delta = manager.swap(
             x.key,
-            SwapParams(
-                x.zeroForOne,
-                -int256(x.amountIn),
-                x.zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
-            ),
+            SwapParams(x.zeroForOne, -int256(x.amountIn), x.zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1),
             ""
         );
         int128 inputDelta = x.zeroForOne ? delta.amount0() : delta.amount1();
@@ -201,7 +213,58 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
         if (spent < x.amountIn) IERC20(Currency.unwrap(payCurrency)).safeTransfer(payer, x.amountIn - spent);
         xIn = Currency.unwrap(payCurrency);
         xOut = Currency.unwrap(receiveCurrency);
-        emit XTraded(payer, xIn, xOut, spent, received);
+        emit XTraded(payer, X_V4, xIn, xOut, spent, received);
+    }
+
+    /// @dev Exact-input swap straight against a v3 pool; the pool pays the recipient, we pay in the callback.
+    function _tradeV3(address payer, XTrade memory x) private returns (uint256 received, address xIn, address xOut) {
+        IUniswapV3PoolSwap pool = IUniswapV3PoolSwap(x.pool);
+        address t0 = pool.token0();
+        address t1 = pool.token1();
+        bool zeroForOne = x.tokenIn == t0;
+        if (!zeroForOne && x.tokenIn != t1) revert InvalidSwap();
+        xIn = x.tokenIn;
+        xOut = zeroForOne ? t1 : t0;
+        uint256 before = IERC20(xOut).balanceOf(payer);
+        v3Pending = x.pool;
+        pool.swap(payer, zeroForOne, int256(x.amountIn), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1, "");
+        delete v3Pending;
+        received = IERC20(xOut).balanceOf(payer) - before;
+        if (received < x.minOut || received == 0) revert Slippage();
+        uint256 left = IERC20(xIn).balanceOf(address(this));
+        if (left > 0) IERC20(xIn).safeTransfer(payer, left);
+        emit XTraded(payer, X_V3, xIn, xOut, x.amountIn - left, received);
+    }
+
+    function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
+        if (msg.sender != v3Pending || v3Pending == address(0)) revert UnauthorizedCallback();
+        IUniswapV3PoolSwap pool = IUniswapV3PoolSwap(msg.sender);
+        if (amount0Delta > 0) IERC20(pool.token0()).safeTransfer(msg.sender, uint256(amount0Delta));
+        if (amount1Delta > 0) IERC20(pool.token1()).safeTransfer(msg.sender, uint256(amount1Delta));
+    }
+
+    /// @dev Exact-input swap against a v2 pair: send the input, take the constant-product output to the payer.
+    function _tradeV2(address payer, XTrade memory x) private returns (uint256 received, address xIn, address xOut) {
+        IUniswapV2PairSwap pair = IUniswapV2PairSwap(x.pool);
+        address t0 = pair.token0();
+        address t1 = pair.token1();
+        bool zeroForOne = x.tokenIn == t0;
+        if (!zeroForOne && x.tokenIn != t1) revert InvalidSwap();
+        xIn = x.tokenIn;
+        xOut = zeroForOne ? t1 : t0;
+        (uint112 r0, uint112 r1,) = pair.getReserves();
+        (uint256 rIn, uint256 rOut) = zeroForOne ? (uint256(r0), uint256(r1)) : (uint256(r1), uint256(r0));
+        uint256 pairBefore = IERC20(xIn).balanceOf(x.pool);
+        IERC20(xIn).safeTransfer(x.pool, x.amountIn);
+        uint256 actualIn = IERC20(xIn).balanceOf(x.pool) - pairBefore; // fee-on-transfer safe
+        uint256 inWithFee = actualIn * 997;
+        uint256 out = inWithFee * rOut / (rIn * 1000 + inWithFee);
+        if (out == 0) revert Slippage();
+        uint256 before = IERC20(xOut).balanceOf(payer);
+        pair.swap(zeroForOne ? 0 : out, zeroForOne ? out : 0, payer, "");
+        received = IERC20(xOut).balanceOf(payer) - before;
+        if (received < x.minOut || received == 0) revert Slippage();
+        emit XTraded(payer, X_V2, xIn, xOut, actualIn, received);
     }
 
     function _pay(Currency c, uint256 amount) private {

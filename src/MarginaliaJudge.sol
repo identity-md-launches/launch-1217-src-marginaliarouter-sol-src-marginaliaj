@@ -4,7 +4,6 @@ pragma solidity 0.8.26;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {OracleAttestation, OracleAttestationConsumer} from "./OracleAttestation.sol";
 import {IIntake} from "./interfaces/IIntake.sol";
 
@@ -72,33 +71,48 @@ contract MarginaliaJudge is OracleAttestationConsumer, ReentrancyGuard {
         bytes32[] memory ids = hook.notesOfDay(day);
         bytes memory allow;
         for (uint256 i = 0; i < ids.length; ++i) {
-            allow = bytes.concat(
-                allow,
-                i == 0 ? bytes("") : bytes(","),
-                bytes('"'),
-                bytes(Strings.toHexString(uint256(ids[i]), 32)),
-                bytes('"')
-            );
+            allow = bytes.concat(allow, i == 0 ? bytes('"') : bytes(',"'), _hex(uint256(ids[i]), 32), bytes('"'));
         }
         return string(
             bytes.concat(
-                bytes(
-                    '{"v":1,"question":"Rank the three best-argued Marginalia notes among these ids. Score verifiable reasoning: on-chain reads, named addresses, holder or liquidity facts, mechanism arguments. A note that only states a direction or target scores zero. Ignore whether the call later proved right.","chainId":'
-                ),
-                bytes(Strings.toString(block.chainid)),
+                bytes('{"v":1,"question":"Rank the three best-argued Marginalia notes among these ids by verifiable reasoning (on-chain reads, named addresses, holder or liquidity facts, mechanism arguments). Direction-only notes score zero. Ignore whether the call proved right.","chainId":'),
+                _dec(block.chainid),
                 bytes(',"window":{"hours":24},"answerType":"bytes32[]","evidence":"panel","head":3,"panelSize":'),
-                bytes(Strings.toString(PANEL_SIZE)),
+                _dec(PANEL_SIZE),
                 bytes(',"quorum":'),
-                bytes(Strings.toString(QUORUM)),
+                _dec(QUORUM),
                 bytes(',"validForSeconds":86400,"guards":{"allow":['),
                 allow,
                 bytes(']},"consumer":{"chainId":'),
-                bytes(Strings.toString(block.chainid)),
+                _dec(block.chainid),
                 bytes(',"verifyingContract":"'),
-                bytes(Strings.toHexString(address(this))),
+                _hex(uint256(uint160(address(this))), 20),
                 bytes('"}}')
             )
         );
+    }
+
+    function _hex(uint256 v, uint256 len) private pure returns (bytes memory out) {
+        bytes16 digits = "0123456789abcdef";
+        out = new bytes(2 + len * 2);
+        out[0] = "0";
+        out[1] = "x";
+        for (uint256 i = 2 + len * 2; i > 2; --i) {
+            out[i - 1] = digits[v & 0xf];
+            v >>= 4;
+        }
+    }
+
+    function _dec(uint256 v) private pure returns (bytes memory) {
+        if (v == 0) return "0";
+        uint256 n;
+        for (uint256 t = v; t > 0; t /= 10) ++n;
+        bytes memory out = new bytes(n);
+        for (uint256 i = n; i > 0; --i) {
+            out[i - 1] = bytes1(uint8(48 + v % 10));
+            v /= 10;
+        }
+        return out;
     }
 
     /// @notice Buys the panel's ranking for a finished day whose pot clears the hook's threshold.
