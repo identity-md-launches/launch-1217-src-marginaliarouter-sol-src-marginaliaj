@@ -1,0 +1,50 @@
+# Marginalia — notes in the margin of every trade
+
+A Uniswap v4 hook launch on the IMD protocol (Ethereum mainnet, paired with IMD). Buying MARG through the
+router with a note attached posts a falsifiable call on any ERC-20, backed by a flat stamp and a flat
+refundable deposit. Calls resolve against on-chain price observations; right calls get their deposit back,
+everything else feeds a pot that pays the best-argued notes of the day, ranked by the IMD oracle panel.
+No owner, no pause, no upgrade. Spec: `SPEC.md`.
+
+## Contracts
+
+| Contract | Role |
+|---|---|
+| `Marginalia` | The launch ERC-20: 1,000,000,000 × 1e18 minted once to its deployer (the launch factory). |
+| `MarginaliaHook` | The hook (flags `0x20cc`): binds the launch pool, takes the stamp and deposit on noted buys and the 1%/3% fee on sells, holds notes, observations, records and the pot, and pays out. Its constructor deploys the three companions. |
+| `MarginaliaRouter` | The only path that can attach a note; optionally trades X on a v4 pool in the same transaction so the position is proven. |
+| `MarginaliaJudge` | The oracle consumer: buys one panel ranking per day through the IMD Intake, verifies the EIP-712 attestation, tells the hook whom to pay. |
+| `MarginaliaTreasury` | Receives prizes and gifts; drips 2% of its IMD into the pot daily. No withdraw. |
+
+## Build and test
+
+Solidity 0.8.26, Cancun, via-IR, optimizer 200 runs, `bytecode_hash = "none"`. All dependencies are
+vendored under `lib/` (versions in `dependencies.json`); no network is needed to build or run the unit tests.
+
+```sh
+forge build --sizes
+forge test --no-match-path 'test/fork/*'
+```
+
+The fork rehearsal deploys through the real IMD LaunchFactory on an Ethereum mainnet fork, impersonating
+the protocol's launch wallet, and then posts a note through the router:
+
+```sh
+MAINNET_RPC_URL=https://... forge test --match-path test/fork/MainnetLaunch.t.sol -vvv
+```
+
+## Launch
+
+`launch.json` is the factory manifest: `MarginaliaHook($poolManager, $token, $factory)`, permissions as
+listed, pool paired with IMD at fee 12500 / tick spacing 60. The requester's share seeds the pool
+single-sided; the swarm's 10% goes to the launch's distributor.
+
+## v1 scope and known limits
+
+- Price adapters assume 18-decimal assets on both sides. Quotes other than IMD, ETH or WETH are refused.
+- Noted sells are supported only for notes about MARG itself; sells of MARG that carry no note pay 3%.
+- The router trades X on Uniswap v4 pools only; v3 and v2 adapters are read-only (pricing) for now.
+- The action fee on follow trades, treasury conversion of ETH/USDC/USDT to IMD, the on-chain ERC-8004 agent
+  badge (contract wallets are marked Agent), and attestation re-delivery are specified but not yet built.
+- The judge binds an answer to the Intake request it paid for; it does not recompute the oracle's
+  canonical question hash.

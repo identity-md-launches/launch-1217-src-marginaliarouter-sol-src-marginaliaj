@@ -1,0 +1,28 @@
+[
+  {
+    "repository": "OpenZeppelin/openzeppelin-contracts",
+    "ref": "v5.0.2",
+    "commit": "dbb6104ce834628e473d2173bbc9d47f81a9eec3"
+  },
+  {
+    "repository": "foundry-rs/forge-std",
+    "ref": "v1.9.6",
+    "commit": "3b20d60d14b343ee4f908cb8079495c07f5e8981",
+    "localPatches": [
+      {
+        "path": "lib/forge-std/src/StdAssertions.sol",
+        "description": "Backport upstream fail(string) overload: fail(); vm.assertTrue(false, message). Required to compile the supplied Hook.protected.t.sol against the accepted v1.9.6 dependency; never relaxes an assertion."
+      }
+    ]
+  },
+  {
+    "repository": "Uniswap/v4-core",
+    "ref": "main",
+    "commit": "46c6834698c48bc4a463a86d8420f4eb1d7f3b75"
+  },
+  {
+    "repository": "transmissions11/solmate",
+    "ref": "main",
+    "commit": "89365b880c4f3c786bdd453d4b8e8fe410344a69"
+  }
+]

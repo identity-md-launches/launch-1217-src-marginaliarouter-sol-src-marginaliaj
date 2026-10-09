@@ -1,0 +1,38 @@
+{
+ "action": "launch.open",
+ "input": {
+  "objective": "What each contract does: (1) MarginaliaTreasury holds IMD for the Marginalia note pot; (2) MarginaliaRouter executes a trade on any ERC-20 and posts a note to the Marginalia hook in one transaction; (3) MarginaliaJudge buys one IdentityMD oracle answer per day to rank the best notes and pays them. Who can call what: anyone can call everything; NO owner on any contract; sweep() and drip() on the treasury are permissionless; requestJudging() is permissionless once the pot threshold is met; only the hook may call treasury.fund(). Numbers: treasury drip 2% of IMD balance once per UTC day; judging threshold 2 IMD-equivalent; oracle price 0.5 IMD; prize split 50/30/20; action fee 0.25% split 50% note author / 50% treasury; plain router trades pay 0%. Upgrades and pausing: not upgradeable, not pausable. Outside services and values: Uniswap v4 PoolManager 0x000000000004444c5dc75cb358380d2e3de08a90, IMD 0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7, IdentityMD Intake 0x1397434cd35e8a9c8ac312a61d3a285eb31dea56 (oracle.request@oracle-1, 0.5 IMD, EIP-712 OracleAttestation domain \"IdentityMD Oracle\" v2), the Marginalia hook address passed as a static constructor argument, Uniswap v3 and v2 routers/pools for the X-trade adapters. No token is deployed by this launch. MarginaliaTreasury: receive() accepts ETH; any ERC-20 by transfer; sweep(token) converts ETH/USDC/USDT to IMD through the deepest Uniswap pool with a slippage bound; drip() once per UTC day moves 2% of IMD balance to the hook's global judged pot; fund(day) callable by the hook; no withdraw. MarginaliaRouter: tradeAndNote(TradeParams x, NoteParams n, uint minMargOut) trades X on Uniswap v4 (PoolManager.unlock), v3 or v2, then the IMD→MARG note-swap on the Marginalia pool with abi.encode(n, xResult) as hookData, atomically; note(NoteParams n, uint minMargOut) for declared notes; read-only price adapters (v4 StateLibrary.getSlot0, v3 slot0, v2 getReserves) normalized to IMD via the ETH/IMD hub pool; 0.25% action fee only on trades that reference a note id; no custody beyond the transaction. MarginaliaJudge: holds the IMD approval for Intake; once per UTC day when the global pot ≥ 2 IMD-equivalent, sells pot MARG for 0.5 IMD and calls Intake.request with a bytes32[] answer, head 3, evidence panel, guards.allow = the day's note ids, asking for the three best-argued notes (verifiable reasoning scores; direction-only notes score zero; ignore whether the call proved right); consumes the signed attestation in its callback and pays 50/30/20 of the pot to the ranked notes through the hook; failures roll the pot forward. Foundry tests with a local v4 PoolManager and a mocked Intake. Keep the deployment under 16.7M gas.",
+  "onchain": "evm_contracts",
+  "chainId": 1,
+  "github": true,
+  "shape": "chain",
+  "references": [
+   "oracle-consumer",
+   "uniswap-v4-hooks",
+   "eth-security"
+  ],
+  "steps": [
+   {
+    "skill": "build-contract-project"
+   },
+   {
+    "skill": "adversarial-review"
+   }
+  ]
+ },
+ "_check_result": {
+  "blockers": [],
+  "plan": [
+   "Build and test the contracts",
+   "Test them, as another agent",
+   "Write what to deploy",
+   "Audit the math, as a specialist agent",
+   "Audit the permissions, as a specialist agent",
+   "Audit the economics, as a specialist agent",
+   "Audit the control flow, as a specialist agent",
+   "Judge the audit: reproduce, merge and rank what was found",
+   "Deploy on Ethereum mainnet"
+  ],
+  "checkedAt": "2026-10-09"
+ }
+}

@@ -1,0 +1,43 @@
+{
+ "action": "launch.open",
+ "input": {
+  "objective": "Token name: Marginalia. Token symbol: MARG. Callbacks: beforeInitialize, beforeSwap (returns delta), afterSwap (returns delta). Fee rule: no hook fee on buys; MARG sells pay 1% with a note in hookData, 3% without; the hook's own bond-return swaps are exempt. Where fees go: kept in IMD inside the hook's judged pot — do not sell hook fees for ETH. Who can change it: nobody after deployment (one-time judge bind, then renounced). Build Marginalia: a Uniswap v4 launch on Ethereum mainnet paired with IMD. The launch token is the standard fixed-supply token. Deliver `MarginaliaHook` (flags beforeInitialize, beforeSwap+returnsDelta, afterSwap+returnsDelta; binds the first IMD-paired pool and refuses others) implementing: (1) notes posted via hookData on IMD→token buys — short-form notes are each a falsifiable call on an arbitrary ERC-20 X {X, venue, side, targetBps ≥ ±1000, horizonDays 1–90, textHash} paid for by a flat 0.1 IMD-equivalent non-refundable stamp (to the pot) plus a flat 0.5 IMD-equivalent refundable deposit (the bought tokens, locked for the horizon; returned fee-free as IMD on RIGHT, forfeited to the pot on WRONG/broken/retracted); long-form THESIS notes (≤8 KB event text with citations, 0.5 IMD deposit, no target) are parents whose score is the sum of their child calls' outcomes, deposit refunded on the first child resolution and forfeited if no child posts within 7 days; (2) permissionless `observe`/`settle` resolving each note against the median of ≥3 price observations ≥20 blocks apart in a 6h window after the horizon, with a balanceOf hold rule checked at each observation; bond returned on RIGHT, moved to a per-(X, UTC-day) pot on WRONG or broken hold, returned on no-data; (3) hook fees on token sells only: 1% with a note, 3% without, into the token's own pot; (4) an append-only per-wallet record with the difficulty-weighted score defined in SPEC.md §4.5; (5) GLOBAL daily judging: when the day's pot ≥ 2 IMD-equivalent, a separate `MarginaliaJudge` sells pot tokens for 0.5 IMD and buys an IdentityMD Intake `oracle.request` (bytes32[] answer, head 3, evidence panel, guards.allow = the day's note ids) ranking the best-argued notes; the callback pays 50/30/20 of the pot to them; failures roll the pot forward. Also deliver `MarginaliaTreasury` (ownerless: receives ETH and any ERC-20, permissionless `sweep` to IMD and daily `drip` of 2% into the judged pot; pots are IMD-denominated and forfeited bonds are swapped to IMD at settlement) and `MarginaliaRouter` with `tradeAndNote` (execute an X trade on v4/v3/v2 and the IMD→token note-swap atomically, passing the X result to the hook) and `note` (declared class), a 0.25% action fee on trades initiated from a note (50% to the note author, 50% to the treasury; plain router trades pay nothing), plus read-only price adapters for v4 slot0, v3 slot0, v2 reserves normalized to IMD via the hub pool. No owner, pause, or upgrade anywhere except a one-time judge bind that is then renounced. Parameters as in SPEC.md §7. Keep each deployment under 16.7M gas. Then a static site: chart with notes, feed, wallet record, post form, pots.",
+  "onchain": "univ4_hook",
+  "chainId": 1,
+  "pairWith": "imd",
+  "economics": {
+   "poolBps": 9000
+  },
+  "github": true,
+  "ipfs": "marginalia",
+  "shape": "chain",
+  "references": [
+   "uniswap-v4-hooks",
+   "uniswap-v4-security",
+   "eth-security"
+  ],
+  "steps": [
+   {
+    "skill": "build-contract-project"
+   },
+   {
+    "skill": "adversarial-review"
+   }
+  ]
+ },
+ "_check_result": {
+  "blockers": [],
+  "plan": [
+   "Build and test the contracts",
+   "Test them, as another agent",
+   "Write what to deploy",
+   "Audit the math, as a specialist agent",
+   "Audit the permissions, as a specialist agent",
+   "Audit the economics, as a specialist agent",
+   "Audit the control flow, as a specialist agent",
+   "Judge the audit: reproduce, merge and rank what was found",
+   "Deploy on Ethereum mainnet"
+  ],
+  "checkedAt": "2026-10-09"
+ }
+}

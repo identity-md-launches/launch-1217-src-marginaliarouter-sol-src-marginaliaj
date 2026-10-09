@@ -1,0 +1,250 @@
+# Marginalia ($MARG) — notes in the margin of every trade
+
+**IMD Hackathon entry · spec v0.3 · 2026-10-09** (v0.2: treasury + prize routing, IMD-denominated pots, explorer-link announcement rule)
+Chain: Ethereum mainnet (v1). Robinhood Chain = copy deployment (v2). Launched through the IMD protocol as a `univ4_hook` launch paired with IMD.
+
+---
+
+## 1. One paragraph
+
+Every trade can carry a note that says why, as a falsifiable call: "10× in 30 days." The note is posted by trading $MARG; the $MARG you buy is a bond. The call is checked later against the pool price of the token you traded. Right and still holding: bond back. Wrong or sold early: bond into that token's pot. Once a day the IMD swarm reads the notes and pays the best-argued ones from the pot. Nobody is ever paid for being right about price. Money leaves the system when people are wrong or quiet, and arrives when people explain well. Every wallet builds a public, scored record of its calls.
+
+## 2. Hackathon fit
+
+| Rule | How |
+|---|---|
+| Launch through the IMD protocol in the window | `launch.open`, kind `univ4_hook`, pairWith `imd`, chain 1 |
+| v4 hook or custom contract with meaningful functionality | `MarginaliaHook` (note ledger + bond escrow + pot) + `MarginaliaRouter` (atomic trade-and-note on any token) |
+| "Actually uses IMD" | the $MARG pool is IMD-quoted (every note is an IMD trade), declared-note fees burn IMD, the daily judge is an Intake `oracle.request` paid in IMD from the pot |
+| Dedicated X account | @marginalia_xyz or similar (TBD) |
+| Submit via IMD Radar | contract = the hook address; confirm payout mapping with @imdradar first (open question §12) |
+
+## 3. Actors and post classes
+
+| Class | Who | Position | Bond | How it posts |
+|---|---|---|---|---|
+| **Traded** | any wallet | proven (router executed the X trade in the same tx) | yes | router `tradeAndNote` |
+| **Declared** | any wallet | none, or self-reported (labeled UNVERIFIED) | yes | router `note` (buys $MARG only) |
+| **Agent** | any wallet a bot controls: IMD seat agents given a key by their operator, Orbio agent vaults, sniper/arb bots, contract wallets | proven or declared | yes | the SAME router calls as humans. Badge by READING the ERC-8004 IdentityRegistry (wallet owns a registered agent → badge + agentId on the record) or `code.length > 0`, else self-declared at first post. No protocol write is needed; nothing about participation depends on IMD's writer wallet. |
+| **Attested** | the IMD swarm panel | none | none | an Intake `oracle.request` whose callback is the hook; the signed attestation posts as a note. Anyone may pay the 0.5 IMD. We do not. |
+
+Agents are a first-class class, not an afterthought: a bot always has a reason (its rule), it posts consistently, and its record is the cleanest test of the scoring. The feed renders class badges and the leaderboard has a machine tab from day one. Seats do not come with trading keys (the protocol never hands a daemon a wallet), so a seat agent posts only when its operator funds a key and instructs it — recruiting, not code; first asks: swarmbrain's operator, the DAEMON sniper on Robinhood, Orbio agent-vault operators.
+
+**Swarm integrations (v1 unless marked):**
+- **The feed is an oracle source (v1, free).** The site exposes a machine-readable notes index + `llms.txt` (how to post, encode hookData, bond/hold/resolution rules, ABI). Oracle bodies can pin it in `guards.sources`, so the panel answers "what is the case on X" from notes that carry wallets, bonds and outcomes. The swarm becomes a reader of the record.
+- **Genesis note (v1, the one 0.5 IMD question we pay).** The first note on the feed is the swarm panel's attested thesis on $MARG at launch.
+- **Attested self-made verdict (v1.1, pot-funded).** Docs caveat: `evidence = chain` answers come from FIXED recipes (log-sum, log-count, log-rank, call-compare, v4-volume-rank, univ4-spot); a ratio of one wallet's swaps to the pool's is not a recipe, so this is either TWO `uint256` log-sum questions (the poster's swap volume filtered by indexed sender vs the pool's total) compared on-chain, or one `bool` with `evidence = panel`. Budget 1 IMD per verdict; run only for RIGHT notes above a difficulty threshold. The `univ4-spot` recipe (median of up to 61 blocks across a window) is also the cheapest honest way to get a manipulation-resistant settle price if the on-chain observation scheme ever proves too thin — 0.5 IMD per settlement, pot-funded, v1.1 option.
+- **Rebuttals (v1.1, pot-funded).** For notes above a bond threshold, the pot buys one panel rebuttal posted under the note; the author may answer with a second note.
+
+## 4. Mechanics
+
+### 4.1 Posting
+A note is `{token X, venue/poolId, side (BUY/SELL), targetBps, horizonDays, text ≤ 280 chars}`.
+- `targetBps` is the claimed move: BUY notes claim price ≥ post × target (target > 1.00); SELL notes claim price ≤ post × target (target < 1.00). "Up" is not a target; the minimum claim is ±10% (`|target − 1| ≥ 1000 bps`).
+- `horizonDays` in [1, 90].
+- Text is emitted in an event (`NotePosted`), not stored; only `keccak(text)` is stored.
+- The router (a) executes the X trade on X's own pool when present, (b) swaps IMD → $MARG on our pool with the note in `hookData`, (c) the hook records the note and locks the $MARG output as the bond.
+- Post-time price of X is read on-chain at posting (adapters §5.3) and stored.
+
+### 4.1b Thesis notes (long-form, parent–child)
+- A **thesis** is a long-form note: up to 8 KB of text with citations (URLs, tx hashes, contract addresses), emitted in event data (~8 gas/byte — under a dollar on mainnet, permanent, no IPFS dependency). No token target, no price resolution. Posting takes a 0.5 IMD deposit (in $MARG, IMD-sized like a bond).
+- **Child calls** are ordinary short-form notes carrying `parentId`. They bond and resolve exactly as in §4.3.
+- **A thesis is scored by its children:** its record = the sum of its children's outcomes × difficulty. The deposit returns when the first child resolves (any outcome). A thesis with no child within 7 days forfeits the deposit to the pot — an essay with no position is not a thesis.
+- Theses are judged in their own weekly category from the pot (same rubric: verifiable reasoning and citations), alongside the daily note prize.
+- Example: parent "the privacy sector re-rates after on-chain security failures" (cites incidents + contract reads) → children "RAIL 2× in 60d", "X +50% in 30d".
+
+### 4.2 Stamp + deposit (the bond is FLAT — never a bet size)
+- Every note costs two flat amounts, both IMD-sized at post and paid by the $MARG buy that posts it: a **stamp** of 0.1 IMD-equivalent, non-refundable, straight to the pot (every note funds judging, right or wrong), and a **deposit** of 0.5 IMD-equivalent, refundable, locked for the horizon.
+- The deposit is the same for every note. Conviction is expressed by the TRADE SIZE (shown on the card) and by the claim's difficulty (target × horizon × mcap), both of which the record resolves. A variable "bet" was considered and rejected: a bond that scales with conviction becomes a signal to pile in, which is the fomo dynamic this design exists to avoid.
+- Gambling test: money can only be LOST by the poster, only to a pot that pays writing quality, never won on price, and never sized by the poster. It is a posting deposit, the court-bond / Kleros-juror shape, not a wager., converted to $MARG at our pool's post-time price. A moving $MARG price cannot change what being wrong costs.
+- Locked in the hook (ERC-6909 claim or plain balance; the swarm picks the simpler audited path).
+- Deposit returned on RESOLVED_RIGHT. Moved to the pot on RESOLVED_WRONG, VOID_SOLD or RETRACTED. Returned on VOID_NODATA (no valid observations). The stamp is never returned.
+- **Fee-free return path.** `claimBond(noteId)` swaps the returned $MARG back to IMD inside the hook under a hook-signed exemption, so a right caller receives IMD and never pays the sell fee. The sell fee (§4.6) therefore applies only to $MARG that was not a bond: airdrop seats and speculators.
+- **Disclosed exposure.** The bond is sized in IMD at post but HELD as $MARG for the horizon, so every poster is long $MARG until resolution; a right caller gets back the deposit's $MARG, worth more or less IMD than at post. This is the token's economic role (note volume locks float) and is printed on every note card. (Alternative considered and rejected for v1: IMD escrow with a ticket swap — removes the exposure but makes $MARG ornamental.)
+
+### 4.3 Resolution
+- Settlement window: `[horizonEnd, horizonEnd + 6h]`.
+- Anyone may call `observe(noteId)` inside the window; each call stores the current X price. Minimum 3 observations at least 20 blocks apart; the **median** is the settle price. A note with fewer than 3 observations by window end resolves VOID_NODATA (bond back, no score).
+- RIGHT if the median meets the target; else WRONG.
+- Hold rule: for BUY notes the poster's X balance at each observation ≥ post-trade balance; for SELL notes ≤ post-trade balance. Any observation failing it → VOID_SOLD (bond to pot, scored as a broken call). Balance is read at observation time; selling on any venue breaks it.
+- **Retraction.** Before the horizon the author may call `retract(noteId, text)`: the bond goes to the pot, the note resolves RETRACTED with the reason emitted, scored at −0.5 × difficulty (half a wrong call) and never marked broken. Retracting with a note beats being caught selling, so the feed captures exit reasoning instead of silent abandonment.
+- `settle(noteId)` is permissionless; keeper reward = 2% of the bond, paid from the bond on WRONG/VOID_SOLD, from the pot on RIGHT (pot may be 0 → no reward; keepers are us and the swarm's heartbeat).
+
+### 4.4 Pot and judging
+- `pot[day]` = all stamps + forfeited deposits that day + the $MARG sell fees (§4.6) + the treasury drip (§6.1) + the action fee's treasury share (§4.9). One global pot per day; per-token sub-pots are display only.
+- **Judging is GLOBAL, once per UTC day** (not per token — per-token-day questions at 0.5 IMD each would drain a thin pot): when the day's global pot ≥ 2 IMD-equivalent, the judge contract sells enough pot $MARG for 0.5 IMD and calls `Intake.request("oracle.request@oracle-1", body, (judge, onOracleResult), IMD, 0.5e18)`. Body: `bytes32[]` answer, `head = 3`, `evidence = panel`, `guards.allow` = the day's eligible noteIds. Question: "Rank the three best-argued notes among these ids. Score verifiable reasoning (on-chain reads, named addresses, holder or liquidity facts, mechanism arguments). A note that only states a direction or target scores zero. Ignore whether the call later proved right."
+- Payout 50/30/20 of the day's pot to the three ids in order (weekly thesis category per §4.1b). `quorum_unreachable` or no callback within 24h → pot rolls into the next day.
+- Judging is for explanation quality only. The oracle never resolves price.
+- Mechanics per the docs: `consumer = {chainId, verifyingContract: hook}`; `evidence = panel`; `answerType = bytes32[]`, `head = 3`; panel ≥ 5 (check-enforced minimum), quorum 70% rounded up by default; `guards.allow` = the day's note ids (max 256 — cap the eligible set at 256 by stamp order); `validForSeconds` 86,400. Status 2 (panel disagreed) spends the payment with no answer → pot rolls forward. Callback gas 200k: the callback only STORES the ranked ids; `payJudged(day)` is a separate permissionless call.
+
+### 4.5 Score (per wallet, on-chain, append-only)
+- `score += difficulty × outcome`, outcome in {+1 RIGHT, −1 WRONG, −1 VOID_SOLD, −0.5 RETRACTED, 0 VOID_NODATA}.
+- `difficulty = log2(|target|) × sqrt(30 / horizonDays) × tier(mcapAtPost)`, tier = 1 (< $1M), 2 ($1M–$10M), 3 (> $10M). Mcap at post = `totalSupply × price` read on-chain; unreadable → tier 1.
+- Counts: posted / right / wrong / broken / judged-wins. All public via `recordOf(wallet)`.
+- **Self-made flag is off-chain.** The hook cannot see X's total volume. The site's indexer marks notes where the poster's own router volume on X over the horizon exceeded 20% of X's pool volume, labeled "self-made (indexer)". Disclosed as indexer-based, never claimed as on-chain.
+
+### 4.6 $MARG pool rules (hook on our own pool)
+- Buys: no hook fee. Buying $MARG with a note in hookData is posting; without a note it is just a buy.
+- Bond returns via `claimBond` are fee-exempt (§4.2). The fees below hit non-bond sells only: airdrop seats (the launch-day endowment) and speculators.
+- Sells with a note attached (a SELL note on $MARG itself): 1% hook fee → pot[$MARG].
+- Sells without a note: 3% hook fee → pot[$MARG].
+- No other hook fees. The factory LP fee (1.25%) is separate: 1% to the paying wallet, 0.25% to the protocol. **The paying wallet's 1% is routed to the pot on every distribution** (we do not keep it).
+
+### 4.7 Note fee (anti-spam)
+- Declared notes (no proven trade) pay 0.1 IMD, burned (`transfer(dead)` or bridge-to-burn; the swarm picks the path the audit accepts).
+- Traded notes pay nothing beyond the bond.
+
+### 4.8 Identity link (optional, v1.1)
+A wallet or agent may bind an X handle on-chain. Flow: the wallet signs `link:<handle>:<nonce>`; the user posts a tweet from that handle containing the wallet address and the signature; the user (not us) pays a 0.5 IMD Intake `oracle.request` with `evidence = panel`, `guards.sources = ["https://x.com/<handle>/"]`, answer type `bool` ("does this handle's tweet contain this wallet and a valid signature?"); the callback writes `handleOf[wallet]` on the hook. One handle per wallet, one wallet per handle at a time; re-binding requires a new tweet. Impersonation is structurally impossible because the proof must come from the handle's own timeline.
+**What a link boosts, and what it never touches:** feed ranking and the profile card (linked wallets rank above anonymous ones at equal score), eligibility for follow revenue, and a lower bond minimum (0.5 IMD-equivalent instead of 1) because the handle is collateral. It never multiplies the score. The record is about being right and arguing well; a name does not make a call truer. Linking is optional; anonymous records are complete records.
+
+### 4.9 Action fee (reader → writer)
+- A trade initiated from a note's "trade this" button and routed through `MarginaliaRouter` pays 0.25% of the trade, split 50/50 between the note's author and the treasury. Plain trades through the router (no originating note) pay nothing.
+- This is the only money that flows from a reader to a writer, it is paid for acting on a record (the vault-fee shape), and it leaks to anyone who trades elsewhere — accepted; a quarter percent on a one-click trade is below the friction of leaving.
+
+## 5. Contracts
+
+### 5.1 `Marginalia` token
+Fixed by the launcher: 1,000,000,000 × 1e18, plain transfers, no owner. Nothing to specify.
+
+### 5.2 `MarginaliaHook`
+- Constructor `(IPoolManager pm, address token)`; immutable `IMD`, `Intake`, `judge` (one-time bind, then renounced).
+- Flags: `beforeInitialize` (bind the first IMD/$MARG pool, refuse others) + `beforeSwap` + `beforeSwapReturnsDelta` + `afterSwap` + `afterSwapReturnsDelta` (sell fees, note capture, bond lock). Mined address per v4 rules.
+- Storage: `notes[noteId]`, `pot[token][day]`, `record[wallet]`, `observations[noteId][]`, `bond[noteId]`.
+- Functions: `observe`, `settle`, `claimBond`, `recordOf`, `noteOf`, `potOf`, `distributeLpFee` (pulls the paying wallet's accrued 1% into the pot; the paying wallet pre-approves once).
+- Events: `NotePosted(noteId, wallet, class, token, side, targetBps, horizonDays, postPrice, bondMarg, text)`, `Observed`, `Settled(noteId, outcome, settlePrice)`, `Judged(token, day, winners[3], amounts[3])`, `PotFunded`.
+- No owner. No pause. No upgrade. No setter after construction except the one-time judge bind (CabalGate pattern: owner = launcher until bound, then renounced).
+
+### 5.3 `MarginaliaRouter`
+- `tradeAndNote(TradeParams x, NoteParams n, uint bondImd, uint minMargOut)`: executes the X trade (adapters: Uniswap v4 via `PoolManager.unlock`; v3 and v2 via their routers), then the IMD→$MARG swap with `abi.encode(n, xResult)` as hookData. Atomic.
+- `note(NoteParams n, uint bondImd, uint minMargOut)`: declared class; charges the 0.1 IMD fee.
+- Price adapters (read-only, used by the hook at post and by `observe`): v4 `StateLibrary.getSlot0`, v3 `slot0`, v2 `getReserves`. Price is quoted in the pool's quote asset and normalized to ETH, then IMD, via the hub pool, so all targets compare like with like.
+- Fee-on-transfer and rebasing X: supported for the trade, but the hold rule uses raw `balanceOf`, so a rebasing X can VOID_SOLD spuriously; the site warns. Honeypot X: the trade reverts or the sell fails; no special handling.
+- No custody beyond the transaction. No owner.
+
+### 5.4 `MarginaliaJudge`
+- Holds the Intake approval, builds the oracle body, consumes the attestation (`OracleAttestationConsumer`, EIP-712 domain `IdentityMD Oracle / 2`), calls `hook.payJudged`. One outstanding request per `(token, day)`. Anyone may trigger `requestJudging(token, day)` once the pot clears 5 IMD-equivalent.
+
+### 5.5 `MarginaliaTreasury`
+- `receive()` accepts ETH; any ERC-20 arrives by plain transfer. `sweep(token)` (permissionless) converts ETH/USDC/USDT to IMD through the deepest Uniswap pool with a slippage bound. `drip()` (permissionless, once per UTC day) moves 2% of the IMD balance into the global judged pot. `fund(token, day)` is called by the hook at judging time to top up that token-day's pot pro-rata to its note count.
+- Receives: hackathon winnings, the paying wallet's remainder, the forwarded 1% LP fee, forfeited bonds (swapped to IMD at settlement), the quiet-sell tax.
+- No owner, no withdraw, no ERC-721 receiver (a seat must sit in a signing wallet, §6.1).
+
+### 5.6 Deployment shape — ONE launch (2026-10-09, after the full docs read)
+**Verified pattern (imd/place, launch 1033; KingHook 832):** a `univ4_hook` launch deploys token + hook + MerkleDistributor, and the HOOK'S CONSTRUCTOR deploys its companions (`canvas = new Canvas(address(this)); router = new PlaceRouter(poolManager_, address(this));`). The launcher passes exactly `($poolManager, $token, $factory)`; `launch.json` declares the permissions; the verifier's `manifest` check reads the flags; companions are discovered through getters. No second launch, no post-deploy bind, no owner.
+- `MarginaliaHook(IPoolManager pm, address token, address factory)` → constructor validates permissions, then `treasury = new MarginaliaTreasury(address(this), IMD)`, `router = new MarginaliaRouter(pm, address(this), IMD)`, `judge = new MarginaliaJudge(address(this), IMD, INTAKE)`. IMD and Intake are chain constants (mainnet addresses; the Sepolia rehearsal uses that chain's policy IMD).
+- `beforeInitialize` binds the first pool and REQUIRES `sender == factory` and LP fee 12500 (the policy's only tier). The hook must never block the factory's seeding, liquidity or fee claims (CabalCoin's objective states this; copy it).
+- **The hook is the oracle consumer** (EIP-712 domain `IdentityMD Oracle` v2, verifyingContract = hook). The judge is a permissionless HELPER that pays 0.5 IMD and submits; the hook accepts any relayed attestation whose `questionHash` equals the hash it computes itself from the day's note ids (a deterministic body builder, CabalCoin's `QuestionBuilder` pattern) and whose signer is the oracle signer. A missed callback can be re-submitted by anyone (`submit(attestation, signature)`), per the docs. The docs recommend owner-settable intake/action/asset/price/signer for a future `oracle-2`; we accept immutability: a new oracle version means a new helper contract, and the hook's `submit` path keeps working as long as the signer and domain hold.
+- Gas: the launch tx must fit the policy `gasCeilingWei` 0.05 ETH AND the 16.7M single-tx cap. Four contracts from one constructor is fine at ≤2 gwei; the objective says "under ~9M gas" and the Sepolia rehearsal measures it.
+- Fallback if the check or rehearsal refuses companions-in-constructor: the original two-launch shape (hook launch + `evm_contracts` launch, `jobs/launch-2-contracts.json`) with a one-time judge bind.
+
+## 6. Economics summary
+
+| Flow | From | To |
+|---|---|---|
+| Stamp, every note | poster | pot |
+| Deposit, right | poster | poster (fee-free, in IMD) |
+| Deposit, wrong / broken / retracted | poster | pot |
+| Action fee 0.25% on follow trades | reader | 50% author / 50% treasury |
+| Quiet $MARG sell tax 3% (non-bond sells) | seller | pot[$MARG] |
+| Noted $MARG sell fee 1% (non-bond sells) | seller | pot[$MARG] |
+| Bond return (claimBond) | hook | poster, fee-free, in IMD |
+| Declared-note fee 0.1 IMD | poster | burn |
+| LP fee 1% (paying wallet) | traders | pot (routed, not kept) |
+| Judge fee 0.5 IMD/day (global) | pot | IMD treasury |
+| Keeper reward 2% | bond or pot | keeper |
+| Judged prizes 50/30/20 | pot | best notes |
+
+Nothing flows from one trader to another for a price outcome. No team revenue stream exists; the remainder and the LP fee both route to the pot. If the check requires a remainder recipient that is an EOA, the paying wallet forwards it to the pot and the site shows the transfers.
+
+### 6.1 Prize routing (hackathon winnings → the pot)
+Any hackathon winnings are paid to `MarginaliaTreasury`, not to a wallet. Treasury: `receive()` for ETH; accepts any ERC-20 by plain transfer; `sweep(token)` (permissionless) converts ETH/USDC/USDT to IMD through the deepest Uniswap pool; `drip()` (permissionless, once per UTC day) moves 2% of the IMD balance into the global judged pot, which tops up every token-day pot that reaches judging that day, pro-rata to note count. No owner, no withdraw. Pots are denominated in IMD; forfeited $MARG bonds are swapped to IMD at settlement.
+The first-place identity.md NFT cannot go to the treasury: seats pair to a worker by an EIP-712 signature from the holding wallet, which a contract cannot produce. The NFT goes to the paying wallet, which runs it as Marginalia's worker with earnings sent to the treasury (a public commitment, enforced off-chain; disclosed as such on `#/rules`).
+Ask to @imdradar / the IMD team wallet: cash prizes → treasury address (public, verifiable, trust-minimizing); NFT → the paying wallet.
+
+## 7. Parameters (pinned)
+
+| Name | Value |
+|---|---|
+| Stamp (non-refundable) | 0.1 IMD-equivalent per note |
+| Deposit (refundable, flat) | 0.5 IMD-equivalent per note |
+| Action fee | 0.25% of follow trades, 50% author / 50% treasury |
+| Thesis deposit | 0.5 IMD-equivalent; refunded on first child resolution; forfeited if no child within 7 days |
+| Thesis text | ≤ 8 KB, event-only |
+| Min claim | ±10% (1000 bps) |
+| Horizon | 1–90 days |
+| Settlement window | 6 h after horizon end |
+| Observations | ≥ 3, ≥ 20 blocks apart, median |
+| Judging | GLOBAL, once per UTC day, when the day's pot ≥ 2 IMD-equivalent |
+| Judge panel | `head = 3`, `evidence = panel`, 0.5 IMD |
+| Prize split | 50 / 30 / 20 |
+| Quiet-sell tax / noted-sell fee | 3% / 1% |
+| Declared-note fee | 0.1 IMD, burned |
+| Keeper reward | 2% |
+| Self-made (indexer) | own router volume ≥ 20% of X pool volume over the horizon |
+| Text | ≤ 280 chars, event-only |
+
+## 8. Site (swarm-built, static, IPFS)
+
+Pages: `#/chart/<token>` (candles with notes pinned to their post block; class badges; bond and outcome), `#/feed` (global, filter by class/outcome/token), `#/wallet/<addr>` (record: score, calls, judged wins, self-made marks), `#/post` (swap box + note form: token CA, side, target, horizon, text, bond), `#/pots` (per-token pots, next judging, past winners with the attestation link), `#/rules`.
+Reads: public RPC + the hook's events. No backend. Ships `llms.txt` + `/notes.json` (the machine-readable index agents and the oracle read) and a machine tab on the leaderboard. The self-made indexer runs client-side over router events and DexScreener volume, labeled as such.
+
+## 9. Multichain path (v2)
+
+Same four contracts redeployed per chain via the protocol (Robinhood 4663 next; Base when the launcher opens it). Separate $MARG per chain in v2; a LayerZero OFT version later (launches 778/782 show the swarm can ship the endpoints). Records are per wallet address and aggregate on the site across chains.
+
+## 10. Adversarial findings carried into the design
+
+| Risk | Mitigation in spec |
+|---|---|
+| Pot pays direction → pump incentive | Pot pays judged explanation only; price resolution only returns or forfeits your own bond |
+| Spot read at settle is flash-manipulable | ≥3 observations ≥20 blocks apart, median |
+| Hold rule gamed by sell-and-rebuy | Balance checked at every observation; any failure voids |
+| Bond value drifts with $MARG price | Bond sized in IMD terms at post |
+| Self-made calls on microcaps | Off-chain flag, disclosed as indexer-based; difficulty tier by mcap; capped bond makes manipulation unprofitable |
+| "Up" notes | Minimum ±10% target; judge rubric scores direction-only notes zero |
+| Team bag optics | Max poolBps; remainder and LP fee routed to the pot; disclosed on `#/rules` |
+| Oracle quorum fails | Pot rolls forward; price resolution never depends on the oracle |
+| Deployment gas cap | Two launches; hook kept lean |
+| Judging gamed by LLM-polished shill | Rubric favors verifiable on-chain claims; the panel can check them |
+
+## 11. Plan and spend
+
+| Day | Step |
+|---|---|
+| 0 ✅ 2026-10-09 | Free check PASSED for both launches (zero blockers; plan = build → independent tests → 4-specialist audit panel → judge → mainnet deploy). Accepted job bodies saved in `jobs/launch-1-hook.json` and `jobs/launch-2-contracts.json`. ⚠ Platform quirk: a launch with NO named steps fails with `bad_path_count` (even a trivial hook) — always pass `shape: "chain"` + `steps: [build-contract-project, adversarial-review]`; the planner then upgrades the review to the audit panel. The fact extractor leaves name/symbol/callbacks "unknown" at check time (non-blocking); keep them stated in the objective's first sentences. Default hook-fee rule ("fees sold for ETH") is overridden in prose. The site is NOT in the launch plan — it is a `job.continue` (`frontend-for-contract` + `ipfs`) on the launch's project (workflow.open's evaluator was unavailable at check). **v0.3: ONE launch — the hook constructor deploys treasury/router/judge (imd/place pattern); `jobs/launch-1-hook.json` superseded by `jobs/launch-hook-v3.json`.** |
+| 1 | Create the project X account (✅ @marginalia_md, 2026-10-09; Radar DM sent from the personal account) and a FRESH paying wallet (a few IMD + a little ETH, no other history). DM @imdradar: "for a swarm launch your deployer field resolves to the IMD LaunchFactory (or nothing on Robinhood); will cash prizes go to a contract address we name (the treasury) and the NFT to the paying wallet?" Run the free `POST /requests/check` with §13; read blockers. |
+| 2–4 | `launch.open` on Sepolia first (default chain) → fix → mainnet. Order per §5.6 (treasury before hook if the check requires it). |
+| 4–6 | `evm_contracts` launch (treasury + router + judge). `workflow.open` for the site. |
+| 6–9 | `job.continue` rounds for fixes. 2–3 real notes from our own small trades. Post the explorer job + launch links FIRST in every announcement (pegzeus rule, surf-endorsed 2026-10-09): prompt, checks and provenance are the trust layer, not the contract address. |
+| 9–12 | Seat holders post from the airdrop. Agent class: invite one bot operator. Submit on Radar by Oct 19 with: explorer links, hook address as the contract, treasury address + paying wallet named in the About text (the only payee declaration we control). |
+| after | If a prize lands: cash → treasury (drips into pots), NFT → paying wallet, run as Marginalia's worker with earnings to the treasury (§6.1). |
+
+**Spend cap: 10 IMD total (~$90).** No oracle questions on our dime. Zero if damian_et or the SIMD vault covers the launch.
+
+## 12. Open questions (answer before paying)
+
+0. **Payment mechanics (docs, verified):** x402 + Permit2 on mainnet IMD, the server pays gas; the paying wallet signs the Permit2 payment AND an EIP-712 `QuoteApproval`; EOA or 7702 only (no Safe); needs IMD balance + a one-time Permit2 approval of IMD (one tx, needs a little ETH); quotes last 600 s; `resultGuaranteed: false` (payment buys admission, not a result); 30 quotes/min. Payment is mainnet IMD even for a Sepolia launch.
+0b. **`GET /launches/:id` carries `requester` = the paying wallet** (953: 0xfc3c…, 1033: 0xa7e9…). That is the field Radar should pay; cite it in the DM follow-up.
+0c. **`workflow.open` is the one-payment contracts+site route, but its check returned `evaluation_unavailable` (semantic evaluator offline at check time, 2026-10-09)** — plan stays launch.open + a `job.continue` site job (`frontend-for-contract`, `ipfs: "marginalia"`) on the launch's project; re-probe the workflow check before paying, it would save a round.
+1. Radar's deployer field is the literal on-chain creator resolved at submission (verified 2026-10-08: the one Ethereum entry resolved to the entrant's factory CONTRACT; all four Robinhood/Base entries and the one real swarm launch, imd/place, resolved to nothing). For us it would resolve to the IMD LaunchFactory. Ask: cash prizes → treasury address, NFT → paying wallet.
+2. Can a `univ4_hook` launch include extra contracts, or is the router a separate `evm_contracts` launch (assumed yes)?
+3. `poolBps` maximum and remainder rules for hook launches at the check.
+4. Does the hook constructor get `$token` (WorkLaunchHook3 pattern)? Assumed yes.
+5. Can the paying wallet's 1% LP fee be redirected at launch, or only forwarded after each distribution? Assumed forwarded.
+
+## 13. Job objective (paste into the check) — v0.3, single launch (wire limit: the rendered assignment must stay under 8,000 chars, so this is ≤ ~5,000)
+
+> Token name "Marginalia", symbol "MARG". Callbacks: beforeInitialize, beforeSwap with beforeSwapReturnDelta, afterSwap with afterSwapReturnDelta. Fee rule: no hook fee on buys; MARG sells pay 1% with a note in hookData, 3% without; the hook's own deposit-return swaps are exempt. Where fees go: kept in IMD in the hook's judged pot, never sold for ETH. Who can change it: nobody after deployment; no owner, pause, upgrade or setters anywhere.
+>
+> Marginalia is a Uniswap v4 hook launch on Ethereum mainnet paired with IMD. MarginaliaHook(IPoolManager, token, factory) validates its permissions, binds the first pool initialized through it (requires the supplied factory and LP fee 12500, never blocks the factory's seeding, liquidity or fee claims, refuses later pools) and in its constructor deploys three companions exposed by getters: MarginaliaTreasury, MarginaliaRouter, MarginaliaJudge (the imd/place pattern).
+>
+> NOTES. A note is a falsifiable call on any ERC-20 X {X, venue, side BUY/SELL, targetBps with |target-1| >= 1000, horizonDays 1-90, text <= 280 chars emitted in the event, textHash stored}, posted via hookData on an IMD->MARG buy, paid by a flat 0.1 IMD-equivalent non-refundable stamp (to the pot) plus a flat 0.5 IMD-equivalent refundable deposit (the bought MARG, locked for the horizon). A THESIS note is long-form (<= 8 KB with citations in the event, 0.5 IMD deposit, no target); child notes carry parentId; a thesis scores as the sum of its children; its deposit returns on the first child resolution and is forfeited if no child posts within 7 days. Classes: traded (router executed the X trade in the same tx), declared, agent (wallet owns an ERC-8004 agent per the IdentityRegistry, or has code, or self-declares), attested (an Intake attestation relayed to the hook).
+>
+> RESOLUTION. Permissionless observe(noteId) in a 6-hour window after the horizon stores X's price (adapters: v4 StateLibrary.getSlot0, v3 slot0, v2 getReserves, normalized to IMD via the ETH/IMD hub pool) and the poster's X balance; >= 3 observations >= 20 blocks apart; median = settle price. RIGHT: deposit returned fee-free as IMD via claimDeposit (hook swaps MARG->IMD under its own exemption). WRONG: deposit to pot. A BUY note's balance below post-trade at any observation (or a SELL note's above): VOID_SOLD, deposit to pot. Under 3 observations: VOID_NODATA, refund, unscored. retract(noteId, text) before the horizon: deposit to pot, scored -0.5. settle is permissionless, keeper reward 2% of the deposit. Per-wallet append-only record: score += difficulty x outcome, outcomes {+1, -1, -1, -0.5, 0}, difficulty = log2(|target|) x sqrt(30/horizonDays) x mcap tier (1 under $1M, 2 to $10M, 3 above; unreadable = 1).
+>
+> POT AND JUDGING. One global pot per UTC day in IMD = stamps + forfeited deposits (swapped to IMD) + sell fees + treasury drip. The hook is the oracle consumer (EIP-712 "IdentityMD Oracle" v2, verifyingContract = hook). MarginaliaJudge is a permissionless helper: once per day when the pot >= 2 IMD, anyone calls requestJudging(day); it sells pot MARG for 0.5 IMD, approves the IdentityMD Intake 0x1397434cd35e8a9c8ac312a61d3a285eb31dea56 for exactly that and calls Intake.request(bytes32("oracle.request@oracle-1"), body, (hook, selector), IMD, 0.5e18) with a body the hook rebuilds deterministically from the day's note ids: answerType bytes32[], head 3, evidence panel, panelSize 7, quorum 5, validForSeconds 86400, guards.allow = the day's note ids (<= 256 by stamp order), consumer = {1, hook}, question "Rank the three best-argued notes among these ids: score verifiable reasoning (on-chain reads, named addresses, holder or liquidity facts, mechanism arguments); direction-only notes score zero; ignore whether the call proved right." The callback accepts only the Intake, verifies the signature and that questionHash equals its own recomputation, requires agreed >= quorum, and only stores the ranked ids; payJudged(day) pays 50/30/20 of the pot to the authors; public submit(attestation, signature) re-delivers a missed callback; a no-answer status rolls the pot forward.
+>
+> TREASURY: receive() for ETH, any ERC-20 by transfer, permissionless sweep(token) to IMD via the deepest Uniswap pool with a slippage bound, permissionless daily drip() of 2% of IMD into the pot, no withdraw. ROUTER: tradeAndNote(x, n, minMargOut) trades X on v4 (PoolManager.unlock), v3 or v2 then the IMD->MARG note swap atomically with abi.encode(n, xResult) as hookData; note(n, minMargOut) posts a declared note; a 0.25% action fee only on trades referencing an originating note id (50% author, 50% treasury); plain trades pay nothing; no custody.
+>
+> Foundry tests with a local v4 PoolManager and a mocked Intake: both currency orderings, factory seeding, the exemption path, every outcome, the hold rule, retraction, callback and re-submit, action fee. Keep hook plus companions under about 9M gas; bytecode_hash none; Solidity 0.8.26, Cancun, via-IR. The website is a separate continuation job.

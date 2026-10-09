@@ -1,0 +1,43 @@
+{
+ "action": "launch.open",
+ "input": {
+  "objective": "Token name \"Marginalia\", symbol \"MARG\". Callbacks: beforeInitialize, beforeSwap with beforeSwapReturnDelta, afterSwap with afterSwapReturnDelta. Fee rule: no hook fee on buys; MARG sells pay 1% with a note in hookData, 3% without; the hook's own deposit-return swaps are exempt. Where fees go: kept in IMD in the hook's judged pot, never sold for ETH. Who can change it: nobody after deployment; no owner, pause, upgrade or setters anywhere. Marginalia is a Uniswap v4 hook launch on Ethereum mainnet paired with IMD. MarginaliaHook(IPoolManager, token, factory) validates its permissions, binds the first pool initialized through it (requires the supplied factory and LP fee 12500, never blocks the factory's seeding, liquidity or fee claims, refuses later pools) and in its constructor deploys three companions exposed by getters: MarginaliaTreasury, MarginaliaRouter, MarginaliaJudge (the imd/place pattern). NOTES. A note is a falsifiable call on any ERC-20 X {X, venue, side BUY/SELL, targetBps with |target-1| >= 1000, horizonDays 1-90, text <= 280 chars emitted in the event, textHash stored}, posted via hookData on an IMD->MARG buy, paid by a flat 0.1 IMD-equivalent non-refundable stamp (to the pot) plus a flat 0.5 IMD-equivalent refundable deposit (the bought MARG, locked for the horizon). A THESIS note is long-form (<= 8 KB with citations in the event, 0.5 IMD deposit, no target); child notes carry parentId; a thesis scores as the sum of its children; its deposit returns on the first child resolution and is forfeited if no child posts within 7 days. Classes: traded (router executed the X trade in the same tx), declared, agent (wallet owns an ERC-8004 agent per the IdentityRegistry, or has code, or self-declares), attested (an Intake attestation relayed to the hook). RESOLUTION. Permissionless observe(noteId) in a 6-hour window after the horizon stores X's price (adapters: v4 StateLibrary.getSlot0, v3 slot0, v2 getReserves, normalized to IMD via the ETH/IMD hub pool) and the poster's X balance; >= 3 observations >= 20 blocks apart; median = settle price. RIGHT: deposit returned fee-free as IMD via claimDeposit (hook swaps MARG->IMD under its own exemption). WRONG: deposit to pot. A BUY note's balance below post-trade at any observation (or a SELL note's above): VOID_SOLD, deposit to pot. Under 3 observations: VOID_NODATA, refund, unscored. retract(noteId, text) before the horizon: deposit to pot, scored -0.5. settle is permissionless, keeper reward 2% of the deposit. Per-wallet append-only record: score += difficulty x outcome, outcomes {+1, -1, -1, -0.5, 0}, difficulty = log2(|target|) x sqrt(30/horizonDays) x mcap tier (1 under $1M, 2 to $10M, 3 above; unreadable = 1). POT AND JUDGING. One global pot per UTC day in IMD = stamps + forfeited deposits (swapped to IMD) + sell fees + treasury drip. The hook is the oracle consumer (EIP-712 \"IdentityMD Oracle\" v2, verifyingContract = hook). MarginaliaJudge is a permissionless helper: once per day when the pot >= 2 IMD, anyone calls requestJudging(day); it sells pot MARG for 0.5 IMD, approves the IdentityMD Intake 0x1397434cd35e8a9c8ac312a61d3a285eb31dea56 for exactly that and calls Intake.request(bytes32(\"oracle.request@oracle-1\"), body, (hook, selector), IMD, 0.5e18) with a body the hook rebuilds deterministically from the day's note ids: answerType bytes32[], head 3, evidence panel, panelSize 7, quorum 5, validForSeconds 86400, guards.allow = the day's note ids (<= 256 by stamp order), consumer = {1, hook}, question \"Rank the three best-argued notes among these ids: score verifiable reasoning (on-chain reads, named addresses, holder or liquidity facts, mechanism arguments); direction-only notes score zero; ignore whether the call proved right.\" The callback accepts only the Intake, verifies the signature and that questionHash equals its own recomputation, requires agreed >= quorum, and only stores the ranked ids; payJudged(day) pays 50/30/20 of the pot to the authors; public submit(attestation, signature) re-delivers a missed callback; a no-answer status rolls the pot forward. TREASURY: receive() for ETH, any ERC-20 by transfer, permissionless sweep(token) to IMD via the deepest Uniswap pool with a slippage bound, permissionless daily drip() of 2% of IMD into the pot, no withdraw. ROUTER: tradeAndNote(x, n, minMargOut) trades X on v4 (PoolManager.unlock), v3 or v2 then the IMD->MARG note swap atomically with abi.encode(n, xResult) as hookData; note(n, minMargOut) posts a declared note; a 0.25% action fee only on trades referencing an originating note id (50% author, 50% treasury); plain trades pay nothing; no custody. Foundry tests with a local v4 PoolManager and a mocked Intake: both currency orderings, factory seeding, the exemption path, every outcome, the hold rule, retraction, callback and re-submit, action fee. Keep hook plus companions under about 9M gas; bytecode_hash none; Solidity 0.8.26, Cancun, via-IR. The website is a separate continuation job.",
+  "onchain": "univ4_hook",
+  "chainId": 1,
+  "pairWith": "imd",
+  "economics": {
+   "poolBps": 9000
+  },
+  "github": true,
+  "ipfs": "marginalia",
+  "shape": "chain",
+  "references": [
+   "uniswap-v4-hooks",
+   "uniswap-v4-security",
+   "eth-security"
+  ],
+  "steps": [
+   {
+    "skill": "build-contract-project"
+   },
+   {
+    "skill": "adversarial-review"
+   }
+  ]
+ },
+ "_check": {
+  "blockers": [],
+  "plan": [
+   "Build and test the contracts",
+   "Test them, as another agent",
+   "Write what to deploy",
+   "Audit the math, as a specialist agent",
+   "Audit the permissions, as a specialist agent",
+   "Audit the economics, as a specialist agent",
+   "Audit the control flow, as a specialist agent",
+   "Judge the audit: reproduce, merge and rank what was found",
+   "Deploy on Ethereum mainnet"
+  ],
+  "checkedAt": "2026-10-09"
+ }
+}
