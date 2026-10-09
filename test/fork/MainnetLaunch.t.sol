@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import {Test} from "forge-std/Test.sol";
 import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency} from "v4-core/src/types/Currency.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
@@ -33,8 +34,8 @@ contract MainnetLaunchTest is Test {
     /// @dev The policy's opening cap for IMD pairing: 2,500 IMD across 1e9 MARG.
     uint256 constant OPENING_CAP_IMD = 2500 ether;
 
-    address requester = makeAddr("requester");
-    address alice = makeAddr("alice");
+    address requester = makeAddr("marginalia-rehearsal-requester");
+    address alice = makeAddr("marginalia-rehearsal-alice");
     Marginalia token;
     MarginaliaHook hook;
     MarginaliaRouter router;
@@ -43,6 +44,9 @@ contract MainnetLaunchTest is Test {
 
     function setUp() public {
         vm.createSelectFork(vm.envString("MAINNET_RPC_URL"));
+        // A derived test address must not land on a live mainnet contract (makeAddr("alice") does).
+        assertEq(alice.code.length, 0, "alice must be an EOA on the fork");
+        assertEq(requester.code.length, 0, "requester must be an EOA on the fork");
     }
 
     function _sqrt(uint256 x) internal pure returns (uint256 y) {
@@ -161,6 +165,39 @@ contract MainnetLaunchTest is Test {
         assertGt(sqrtP, 0);
         emit log_named_uint("MARG price in IMD (1e18)", hook.margPriceInImd());
         assertLt(launchGas, 16_777_216);
+    }
+
+    function testTradeAndNoteSellsImdOnTheHubPool() public {
+        _launch();
+        deal(IMD, alice, 1000 ether);
+        vm.startPrank(alice);
+        IERC20(IMD).approve(address(router), type(uint256).max);
+        PoolKey memory hub = PoolKey(Currency.wrap(address(0)), Currency.wrap(IMD), 10000, 200, IHooks(address(0)));
+        assertEq(PoolId.unwrap(hub.toId()), hook.HUB_POOL_ID(), "hub key");
+        MarginaliaRouter.XTrade memory x = MarginaliaRouter.XTrade(hub, false, 10 ether, 1); // sell IMD for ETH
+        T.NoteParams memory p;
+        p.x = IMD;
+        p.venue = T.Venue(T.VenueKind.UniV4, hook.HUB_POOL_ID(), address(0), false);
+        p.side = T.Side.Sell;
+        p.targetBps = 7000;
+        p.horizonDays = 14;
+        p.class = uint8(T.Class.Declared);
+        p.text = "IMD -30% in 14d: launch-night sells into a thin hub";
+        uint256 ethBefore = alice.balance;
+        router.tradeAndNote(x, p, 5 ether, 1, block.timestamp + 1);
+        vm.stopPrank();
+        assertGt(alice.balance, ethBefore, "received ETH for the IMD sold");
+        T.Note memory n = hook.noteOf(bytes32(hook.noteCount()));
+        assertEq(uint8(n.class), uint8(T.Class.Traded));
+        assertEq(n.x, IMD);
+        assertEq(n.postBalance, IERC20(IMD).balanceOf(alice));
+        // a traded note about a token other than the one traded is refused
+        p.x = address(token);
+        p.venue = T.Venue(T.VenueKind.UniV4, PoolId.unwrap(key.toId()), IMD, address(token) < IMD);
+        vm.startPrank(alice);
+        vm.expectRevert(MarginaliaRouter.NoteTokenMismatch.selector);
+        router.tradeAndNote(x, p, 5 ether, 1, block.timestamp + 1);
+        vm.stopPrank();
     }
 
     function testNoteAboutImdOnTheHubPool() public {

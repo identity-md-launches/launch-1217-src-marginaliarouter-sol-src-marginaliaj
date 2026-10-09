@@ -51,6 +51,7 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
     error InvalidSwap();
     error Slippage();
     error Expired();
+    error NoteTokenMismatch();
 
     event Swapped(address indexed trader, bool buy, uint256 spent, uint256 received, bool noted);
     event XTraded(address indexed trader, address indexed xIn, address indexed xOut, uint256 spent, uint256 received);
@@ -137,7 +138,14 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
         delete jobHash;
         Job memory job = abi.decode(data, (Job));
         uint256 xResult;
-        if (job.hasX) xResult = _tradeX(job.payer, job.x);
+        if (job.hasX) {
+            address xIn;
+            address xOut;
+            (xResult, xIn, xOut) = _tradeX(job.payer, job.x);
+            // A traded note must be about the token actually traded: bought for a BUY call, sold for a SELL call.
+            address subject = job.note.side == T.Side.Buy ? xOut : xIn;
+            if (subject != job.note.x) revert NoteTokenMismatch();
+        }
 
         PoolKey memory key = hook.getPoolKey();
         address imd = hook.imd();
@@ -170,7 +178,7 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
         return abi.encode(received);
     }
 
-    function _tradeX(address payer, XTrade memory x) private returns (uint256 received) {
+    function _tradeX(address payer, XTrade memory x) private returns (uint256 received, address xIn, address xOut) {
         BalanceDelta delta = manager.swap(
             x.key,
             SwapParams(
@@ -191,7 +199,9 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
         _pay(payCurrency, spent);
         manager.take(receiveCurrency, payer, received);
         if (spent < x.amountIn) IERC20(Currency.unwrap(payCurrency)).safeTransfer(payer, x.amountIn - spent);
-        emit XTraded(payer, Currency.unwrap(payCurrency), Currency.unwrap(receiveCurrency), spent, received);
+        xIn = Currency.unwrap(payCurrency);
+        xOut = Currency.unwrap(receiveCurrency);
+        emit XTraded(payer, xIn, xOut, spent, received);
     }
 
     function _pay(Currency c, uint256 amount) private {
