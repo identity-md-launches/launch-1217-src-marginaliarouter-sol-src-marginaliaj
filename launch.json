@@ -1,0 +1,18 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "MarginaliaRouter",
+      "constructorArgs": []
+    },
+    {
+      "contract": "MarginaliaJudge",
+      "constructorArgs": []
+    },
+    {
+      "contract": "MarginaliaTreasury",
+      "constructorArgs": []
+    }
+  ],
+  "notes": "Deploy the three independent Marginalia companion implementations on Ethereum mainnet. Each has a nonpayable constructor with no arguments, locks its own initialization, and has no owner, pause or upgrade path. A later MarginaliaHook launch must use the resulting implementation addresses to create EIP-1167 clones and initialize each clone once, atomically in the hook constructor. MarginaliaRouter posts notes through IMD/MARG swaps with hookData and optionally trades an ERC-20 through Uniswap v4, v3 or v2 in the same transaction, enforcing that the note concerns the traded token. The 0.25% action fee is absent. MarginaliaJudge requests rankings for completed weeks of long-form theses, verifies IdentityMD Oracle EIP-712 v2 attestations and tells the hook whom to pay. The hook enforces a 2 IMD threshold for the initial weekly judging request and 50/30/20 prizes; the nominal oracle price is 0.5 IMD, with the accepted judge paying the live Intake price up to 1 IMD per request. Each week allows one initial request and one retry after a 3-day timeout. MarginaliaTreasury lets anyone drip 2% of its IMD balance into the hook's prize pools once per UTC day and has no withdrawal function. Clone integrations use PoolManager 0x000000000004444c5dc75cb358380d2e3de08a90, IMD 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7 and Intake 0x1397434cd35e8a9C8aC312A61D3A285EB31dea56. This launch deploys only the implementations, with no token, pool, ETH funding or initialization calls."
+}
