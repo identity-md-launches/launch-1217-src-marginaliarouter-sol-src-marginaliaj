@@ -1,0 +1,20 @@
+{
+  "name": "marginalia-helper",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Local helper: sign IMD protocol payments (x402 + Permit2) with your own wallet; the server only proxies api.imd.fun and keeps the request token.",
+  "scripts": {
+    "build": "esbuild src/app.js --bundle --format=esm --outfile=public/bundle.js --target=es2022 --minify=false",
+    "start": "node server.js",
+    "dev": "npm run build && node server.js"
+  },
+  "dependencies": {
+    "@x402/core": "2.28.0",
+    "@x402/evm": "2.28.0",
+    "viem": "2.57.4"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.10"
+  }
+}

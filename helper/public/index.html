@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Marginalia launch helper</title>
+<style>
+  :root { --bg: #0f1115; --fg: #e6e6e6; --muted: #9aa0a6; --box: #171a21; --line: #2a2f3a; --ok: #7bd88f; --bad: #ff7b72; --accent: #8ab4f8; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.45 system-ui, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 80px; }
+  h1 { font-size: 20px; margin: 0 0 4px; } h2 { font-size: 15px; margin: 24px 0 8px; color: var(--accent); }
+  .box { background: var(--box); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin: 10px 0; }
+  button { background: var(--accent); color: #0b0d12; border: 0; border-radius: 8px; padding: 8px 14px; font-weight: 600; cursor: pointer; margin: 4px 6px 4px 0; }
+  button.secondary { background: #2a2f3a; color: var(--fg); }
+  button:disabled { opacity: .5; cursor: default; }
+  textarea { width: 100%; min-height: 220px; background: #0b0d12; color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font: 12px/1.4 ui-monospace, monospace; box-sizing: border-box; }
+  select, input { background: #0b0d12; color: var(--fg); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; }
+  .kv { display: grid; grid-template-columns: 180px 1fr; gap: 4px 12px; font-family: ui-monospace, monospace; font-size: 13px; }
+  .muted { color: var(--muted); } .ok { color: var(--ok); } .bad { color: var(--bad); }
+  pre { background: #0b0d12; border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow: auto; font-size: 12px; max-height: 320px; }
+  .step { border-left: 3px solid var(--line); padding-left: 12px; margin: 10px 0; }
+  .step.done { border-color: var(--ok); } .step.fail { border-color: var(--bad); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Marginalia launch helper</h1>
+  <div class="muted">Everything is signed in your wallet. This page only talks to a local proxy for api.imd.fun. Spend cap: 10 IMD total.</div>
+
+  <h2>1. Wallet</h2>
+  <div class="box">
+    <button id="connect">Connect wallet</button>
+    <button id="refresh" class="secondary">Refresh balances</button>
+    <div class="kv" id="wallet">
+      <div class="muted">address</div><div id="addr">—</div>
+      <div class="muted">chain</div><div id="chain">—</div>
+      <div class="muted">ETH</div><div id="eth">—</div>
+      <div class="muted">IMD</div><div id="imd">—</div>
+      <div class="muted">IMD → Permit2 allowance</div><div id="allow">—</div>
+    </div>
+    <div style="margin-top:10px">
+      <button id="approve" disabled>Approve 25 IMD to Permit2 (one transaction)</button>
+      <span class="muted">Permit2 is Uniswap's canonical contract 0x000000000022D473030F116dDEE9F6B43aC78BA3. The protocol pulls exactly the quoted amount per order.</span>
+    </div>
+  </div>
+
+  <h2>2. The job</h2>
+  <div class="box">
+    <div>
+      <label class="muted">preset</label> <select id="preset"></select>
+      <label class="muted" style="margin-left:12px">action</label>
+      <select id="action">
+        <option value="launch.open">launch.open</option>
+        <option value="job.open">job.open</option>
+        <option value="job.continue">job.continue</option>
+        <option value="workflow.open">workflow.open</option>
+      </select>
+      <label class="muted" style="margin-left:12px">chainId</label>
+      <input id="chainId" value="1" size="6" />
+    </div>
+    <textarea id="input" spellcheck="false"></textarea>
+    <div style="margin-top:8px">
+      <button id="check" class="secondary">Free check</button>
+      <span class="muted">Runs POST /requests/check: blockers and the plan, nothing held, nothing paid.</span>
+    </div>
+    <pre id="checkOut" class="muted">—</pre>
+  </div>
+
+  <h2>3. Pay</h2>
+  <div class="box">
+    <button id="pay" disabled>Quote and pay 0.5 IMD</button>
+    <span class="muted">Quote → challenge → two signatures in your wallet (Permit2 payment + quote approval) → submit → poll until admitted.</span>
+    <div id="steps"></div>
+    <pre id="payOut" class="muted">—</pre>
+  </div>
+
+  <h2>Orders this session</h2>
+  <div class="box"><pre id="orders" class="muted">none yet</pre></div>
+</main>
+<script type="module" src="/bundle.js"></script>
+</body>
+</html>
