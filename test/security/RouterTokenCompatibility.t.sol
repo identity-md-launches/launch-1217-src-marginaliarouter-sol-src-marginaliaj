@@ -17,7 +17,8 @@ contract RouterBehaviorToken is ERC20 {
         FalseReturn,
         Blocked,
         Reenter,
-        Tax
+        Tax,
+        FullTax
     }
     Mode public mode;
     uint8 private immutable units;
@@ -67,8 +68,8 @@ contract RouterBehaviorToken is ERC20 {
     }
 
     function _update(address from, address to, uint256 amount) internal override {
-        if (mode == Mode.Tax && from != address(0) && to != address(0)) {
-            uint256 fee = amount / 10;
+        if ((mode == Mode.Tax || mode == Mode.FullTax) && from != address(0) && to != address(0)) {
+            uint256 fee = mode == Mode.FullTax ? amount : amount / 10;
             super._update(from, address(0), fee);
             amount -= fee;
         }
@@ -174,6 +175,105 @@ contract RouterTokenCompatibilityTest is Fixture {
         router.tradeAndNote(t, p, 10 ether, 1, block.timestamp);
         assertEq(x.balanceOf(alice) - beforeX, t.minOut);
         assertEq(imd.balanceOf(address(router)), 0);
+    }
+
+    function test_TaxedInputMeasuresBothTransfersWithoutUsingDonations() public {
+        _taxedInput(100e6, 0);
+        _taxedInput(100e6, 37e6);
+    }
+
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_TaxedInputPreservesDonationsAndAccountsForBothBurns(uint256 amount, uint256 donation)
+        public
+    {
+        _taxedInput(bound(amount, 1, 1000e6), bound(donation, 0, 1000e6));
+    }
+
+    function _taxedInput(uint256 amount, uint256 donation) internal {
+        x.setMode(RouterBehaviorToken.Mode.Normal);
+        x.transfer(address(router), donation);
+        imd.transfer(address(router), 13 ether);
+        uint256 routerX = x.balanceOf(address(router));
+        uint256 routerImd = imd.balanceOf(address(router));
+        x.setMode(RouterBehaviorToken.Mode.Tax);
+        (MarginaliaRouter.XTrade memory t, T.NoteParams memory p) = _args(false, amount);
+        uint256 beforeX = x.balanceOf(alice);
+        uint256 pairX = x.balanceOf(address(pair));
+        uint256 pairImd = imd.balanceOf(address(pair));
+        uint256 beforeImd = imd.balanceOf(alice);
+        uint256 beforeMarg = token.balanceOf(alice);
+        uint256 supply = x.totalSupply();
+        uint256 noteCount = hook.noteCount();
+        vm.startPrank(alice);
+        x.approve(address(router), amount);
+        uint256 margOut = router.tradeAndNote(t, p, 10 ether, 1, block.timestamp);
+        vm.stopPrank();
+        uint256 firstBurn = amount / 10;
+        uint256 secondBurn = (amount - firstBurn) / 10;
+        assertEq(beforeX - x.balanceOf(alice), amount);
+        assertEq(x.balanceOf(address(pair)) - pairX, amount - firstBurn - secondBurn);
+        assertEq(supply - x.totalSupply(), firstBurn + secondBurn);
+        assertEq(x.balanceOf(address(router)), routerX, "donations cannot subsidize transfer taxes");
+        assertEq(imd.balanceOf(address(router)), routerImd);
+        assertEq(imd.balanceOf(alice) + 10 ether - beforeImd, pairImd - imd.balanceOf(address(pair)));
+        assertGt(pairImd - imd.balanceOf(address(pair)), 0);
+        assertEq(token.balanceOf(alice) - beforeMarg, margOut);
+        assertEq(x.allowance(alice, address(router)), 0);
+        assertEq(hook.noteCount(), noteCount + 1);
+        T.Note memory n = hook.noteOf(bytes32(noteCount + 1));
+        assertEq(n.author, alice);
+        assertEq(n.x, address(x));
+        assertEq(n.class, uint8(T.Class.Traded));
+    }
+
+    function test_TaxedInputSlippageRollsBackBurnsAllowancesAndPairReserves() public {
+        x.transfer(address(router), 37e6);
+        x.setMode(RouterBehaviorToken.Mode.Tax);
+        (MarginaliaRouter.XTrade memory t, T.NoteParams memory p) = _args(false, 100e6);
+        uint256 beforeX = x.balanceOf(alice);
+        uint256 beforeImd = imd.balanceOf(alice);
+        uint256 supply = x.totalSupply();
+        uint256 allowance = x.allowance(alice, address(router));
+        uint256 pairX = x.balanceOf(address(pair));
+        uint256 pairImd = imd.balanceOf(address(pair));
+        (uint112 r0, uint112 r1,) = pair.getReserves();
+        for (uint256 i; i < 2; ++i) {
+            t.minOut = i == 0 ? type(uint256).max : 1;
+            vm.prank(alice);
+            vm.expectRevert(MarginaliaRouter.Slippage.selector);
+            router.tradeAndNote(t, p, 10 ether, i == 0 ? 1 : type(uint256).max, block.timestamp);
+            assertEq(x.balanceOf(alice), beforeX);
+            assertEq(imd.balanceOf(alice), beforeImd);
+            assertEq(x.totalSupply(), supply);
+            assertEq(x.allowance(alice, address(router)), allowance);
+            assertEq(x.balanceOf(address(router)), 37e6);
+            assertEq(imd.balanceOf(address(router)), 0);
+            assertEq(x.balanceOf(address(pair)), pairX);
+            assertEq(imd.balanceOf(address(pair)), pairImd);
+            (uint112 after0, uint112 after1,) = pair.getReserves();
+            assertEq(after0, r0);
+            assertEq(after1, r1);
+            assertEq(hook.noteCount(), 0);
+            assertEq(_claims(address(hook), address(imd)), 0);
+            assertEq(_claims(address(hook), address(token)), 0);
+        }
+    }
+
+    function test_ZeroReceivedInputCannotSpendDonationsOrPostANote() public {
+        x.transfer(address(router), 100e6);
+        x.setMode(RouterBehaviorToken.Mode.FullTax);
+        (MarginaliaRouter.XTrade memory t, T.NoteParams memory p) = _args(false, 100e6);
+        uint256 beforeX = x.balanceOf(alice);
+        uint256 beforeImd = imd.balanceOf(alice);
+        uint256 supply = x.totalSupply();
+        vm.prank(alice);
+        vm.expectRevert(MarginaliaRouter.InvalidSwap.selector);
+        router.tradeAndNote(t, p, 10 ether, 1, block.timestamp);
+        assertEq(x.balanceOf(alice), beforeX);
+        assertEq(imd.balanceOf(alice), beforeImd);
+        assertEq(x.totalSupply(), supply);
+        assertEq(x.balanceOf(address(router)), 100e6);
+        assertEq(hook.noteCount(), 0);
     }
 
     /// forge-config: default.fuzz.runs = 1000

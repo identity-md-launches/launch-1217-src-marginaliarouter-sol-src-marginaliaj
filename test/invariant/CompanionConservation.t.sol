@@ -12,10 +12,18 @@ import {MarginaliaJudge} from "src/MarginaliaJudge.sol";
 import {MarginaliaTreasury} from "src/MarginaliaTreasury.sol";
 import {MarginaliaTypes as T} from "src/MarginaliaTypes.sol";
 import {OracleAttestation} from "src/OracleAttestation.sol";
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {Currency} from "v4-core/src/types/Currency.sol";
+import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 
 /// @dev All value moves through the real companions, hook and local v4 PoolManager.
 /// Time only moves forwards. Every caught failure has an explicit expected cause.
 contract CompanionHandler is Test {
+    using StateLibrary for IPoolManager;
+    using PoolIdLibrary for PoolKey;
+
     MarginaliaHook public hook;
     MarginaliaRouter public router;
     MarginaliaJudge public judge;
@@ -31,6 +39,8 @@ contract CompanionHandler is Test {
     mapping(uint32 => uint256) public paymentCount;
     mapping(uint32 => bytes32) public acceptedOracleId;
     mapping(uint32 => uint256) public dripCount;
+    mapping(uint32 => uint256) public requestCount;
+    mapping(uint32 => uint256) public conversionCount;
     uint256 public donatedTreasury;
     uint256 public dripped;
     uint256 public donatedRouterImd;
@@ -155,28 +165,34 @@ contract CompanionHandler is Test {
             expected = MarginaliaJudge.DayNotOver.selector;
         } else if (judge.judgedSet(w)) {
             expected = MarginaliaJudge.AlreadyJudged.selector;
+        } else if (requestCount[w] == 2) {
+            expected = MarginaliaJudge.AttemptsExhausted.selector;
         } else if (old != bytes32(0) && block.timestamp < uint256(judge.requestedAt(w)) + judge.REQUEST_TTL())
         {
             expected = MarginaliaJudge.AlreadyRequested.selector;
         } else if (hook.thesesOfWeek(w).length == 0) {
             expected = MarginaliaJudge.NoNotes.selector;
-        } else if (hook.thesisPool(w) < 2 ether) {
+        } else if ((requestCount[w] == 0 && hook.thesisPool(w) < 2 ether) || hook.thesisPool(w) < 0.5 ether) {
             expected = MarginaliaHook.PotTooSmall.selector;
         }
         uint256 beforePool = hook.thesisPool(w);
         uint256 beforeJudge = imd.balanceOf(address(judge));
+        uint64 beforeTime = judge.requestedAt(w);
         vm.prank(actors[actorSeed % 3]);
         if (expected != bytes4(0)) {
             vm.expectRevert(expected);
             judge.requestJudging(w);
             assertEq(judge.requestOf(w), old);
+            assertEq(judge.requestedAt(w), beforeTime);
             assertEq(hook.thesisPool(w), beforePool);
         } else {
             bytes32 id = judge.requestJudging(w);
             assertNotEq(id, old);
             assertEq(beforePool - hook.thesisPool(w), 0.5 ether);
             oracleSpent += 0.5 ether;
+            ++requestCount[w];
         }
+        assertEq(judge.attempts(w), requestCount[w]);
         assertEq(imd.balanceOf(address(judge)), beforeJudge, "purchase must not spend donated IMD");
     }
 
@@ -202,6 +218,15 @@ contract CompanionHandler is Test {
         a.issuedAt = uint64(block.timestamp);
         a.expiresAt = uint64(block.timestamp + 1 days);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerKey, judge.attestationDigest(a));
+        if (block.timestamp >= uint256(judge.requestedAt(w)) + judge.REQUEST_TTL()) {
+            vm.prank(hook.INTAKE());
+            vm.expectRevert(MarginaliaJudge.UnknownRequest.selector);
+            judge.onOracleResult(req, a, abi.encodePacked(r, s, v));
+            assertFalse(judge.judgedSet(w));
+            assertFalse(judge.consumed(a.requestId));
+            assertEq(judge.requestOf(w), req);
+            return;
+        }
         vm.prank(hook.INTAKE());
         judge.onOracleResult(req, a, abi.encodePacked(r, s, v));
         acceptedOracleId[w] = a.requestId;
@@ -254,15 +279,39 @@ contract CompanionHandler is Test {
 
     function convert(uint8 actorSeed) public {
         uint256 old = hook.potMarg();
-        vm.prank(actors[actorSeed % 3]);
-        uint256 out = judge.convertForfeits();
+        uint32 day = hook.today();
         if (old == 0) {
-            assertEq(out, 0);
+            vm.prank(actors[actorSeed % 3]);
+            assertEq(judge.convertForfeits(), 0);
+        } else if (conversionCount[day] != 0) {
+            vm.prank(actors[actorSeed % 3]);
+            vm.expectRevert(MarginaliaJudge.AlreadyConverted.selector);
+            judge.convertForfeits();
+            assertEq(hook.potMarg(), old);
         } else {
+            IPoolManager manager = hook.poolManager();
+            PoolKey memory key = hook.getPoolKey();
+            (uint160 sqrtP,,,) = manager.getSlot0(key.toId());
+            uint256 depthLiquidity = manager.getLiquidity(key.toId());
+            uint256 beforeMarg = manager.balanceOf(address(hook), uint256(uint160(address(marg))));
+            uint256 beforeImd = manager.balanceOf(address(hook), uint256(uint160(address(imd))));
+            vm.prank(actors[actorSeed % 3]);
+            uint256 out = judge.convertForfeits();
             assertGt(out, 0);
-            assertEq(hook.potMarg(), 0);
+            uint256 sold = old - hook.potMarg();
+            assertGt(sold, 0);
+            // At most 1% of pre-swap virtual MARG reserves; avoid reimplementing the rounded cap.
+            if (Currency.unwrap(key.currency0) == address(marg)) {
+                assertLe(sold * 100 * uint256(sqrtP), depthLiquidity * (1 << 96));
+            } else {
+                assertLe(sold * 100 * (1 << 96), depthLiquidity * uint256(sqrtP));
+            }
+            assertEq(beforeMarg - manager.balanceOf(address(hook), uint256(uint160(address(marg)))), sold);
+            assertEq(manager.balanceOf(address(hook), uint256(uint160(address(imd)))) - beforeImd, out);
+            assertEq(++conversionCount[day], 1);
             ++conversions;
         }
+        assertEq(judge.converted(day), conversionCount[day] == 1);
     }
 
     function unauthorizedCallback(uint8 actorSeed) public {
@@ -372,8 +421,12 @@ contract CompanionConservationInvariantTest is Fixture {
         assertGt(handler.payouts(), 0);
         assertGt(handler.deliveries(), 0);
         assertGt(handler.conversions(), 0);
+        uint256 requests;
         for (uint256 i; i < handler.weekCount(); ++i) {
             uint32 w = handler.weeksTouched(i);
+            assertEq(judge.attempts(w), handler.requestCount(w));
+            assertLe(handler.requestCount(w), 2);
+            requests += handler.requestCount(w);
             assertEq(judge.paid(w), handler.paymentCount(w) == 1);
             assertEq(hook.judgedPaid(w), judge.paid(w));
             assertLe(handler.paymentCount(w), 1);
@@ -382,5 +435,39 @@ contract CompanionConservationInvariantTest is Fixture {
             assertEq(judge.judgedSet(w), accepted != bytes32(0));
             if (accepted != bytes32(0)) assertTrue(judge.consumed(accepted));
         }
+        assertEq(handler.oracleSpent(), requests * 0.5 ether);
+        uint256 conversions;
+        for (uint256 i; i < handler.dayCount(); ++i) {
+            uint32 d = handler.daysTouched(i);
+            assertLe(handler.conversionCount(d), 1);
+            assertEq(judge.converted(d), handler.conversionCount(d) == 1);
+            conversions += handler.conversionCount(d);
+        }
+        assertEq(handler.conversions(), conversions);
+    }
+
+    function test_HandlerExercisesExpiredDeliveryRetryExhaustionAndDailyConversionLimit() public {
+        // The setup converted one forfeit today. Another forfeit must wait for the next UTC day.
+        handler.forfeit(2);
+        handler.convert(0);
+        handler.advance(1 days);
+        handler.convert(1);
+        handler.note(10 ether, 0, false);
+        handler.donate(0, 1000 ether, 0);
+        handler.drip(1);
+        handler.advance(7 days);
+        handler.request(1, 0);
+        handler.advance(3 days);
+        handler.deliver(1, false);
+        handler.request(1, 1);
+        handler.advance(3 days);
+        handler.deliver(1, false);
+        handler.request(1, 2);
+        assertEq(handler.requestCount(handler.weeksTouched(1)), 2);
+        assertEq(handler.conversions(), 2);
+        invariant_TreasuryDonationsEqualHeldPlusDripped();
+        invariant_RouterAndJudgeRetainOnlyUnsolicitedDonations();
+        invariant_HookClaimsBackEveryImdPoolAndMargDeposit();
+        invariant_JudgmentAndPaymentNeverReopen();
     }
 }
