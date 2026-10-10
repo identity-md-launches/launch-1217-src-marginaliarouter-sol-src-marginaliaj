@@ -82,14 +82,42 @@ digest, callback selector and signature checks are unchanged. `test/fork/Mainnet
 external X trades with theses, since arbitrary external spot prices no longer qualify for scoring.
 `README.md` describes these user-visible limits. No build configuration or dependency was changed.
 
+## Second revision: the flash-observation finding (392cb896…)
+
+The independent reviewer's single required finding reproduced on the accepted tree, with the reviewer's own
+numbers. A contract that, inside one `poolManager.unlock`, bought 5,900 IMD of MARG on a pool 100x the depth
+floor (spot +12%), called `observe` for three sybil +10% calls, sold the MARG back and settled only the
+net IMD, made all three observations in three transactions 25 blocks apart; every call settled Right and
+the sybils claimed 3,077.77 IMD of the week's leaderboard pool against 946.02 IMD of fees. No MARG was
+held across any block. The accepted "≥3 observations ≥20 blocks apart, median" mitigation assumed a
+manipulator must hold the moved price across the gaps; with flash accounting it did not have to.
+
+The advisory finding (6218b3e5…, the reviewer's settlement of the prior round) reports no defect: the 13
+confirmed fixes were left as they are.
+
+| Finding | Files and change | Why / coverage |
+|---|---|---|
+| **392cb896… flash-manipulated observation price.** Reproduced: `forge test --match-path test/scratch/ProofFlashObserve.t.sol` failed on the starting tree with `3077769634732647735453 != 0`. | `src/MarginaliaHook.sol`: the reviewer's suggested fix, which keeps the design. `beforeSwap` records the pool's price before the first swap of each block (`blockOpenPrice`, `lastSwapBlock`); every price move on the bound pool is a swap through this hook, so that is the price the block opened at. `blockPrice()` returns it while `lastSwapBlock == block.number` and the spot otherwise. `observe` stores `blockPrice()`: a swap earlier or later in the same block, by anyone, cannot set an observation, so a manipulator must hold a moved price across the 20-block gaps between the three observations, exposed to arbitrage, which is the model the SPEC's median assumes. The same vector exists at posting, where a flash dump before `router.note` (or pump before `sellWithNote`) would set a depressed or inflated `postPrice` that an unmoved market then "beats": `postPrice` is now the price least favourable to the author among the block-open and the spot price (`_postingPrice`: the higher for a Buy, the lower for a Sell), which leaves the author's own swap impact counted exactly as before and makes an in-block move before the post worthless. A noted sell's deposit is sized at the lower of the two prices, so a flash pump cannot shrink the MARG at stake. Nothing else changes: the gap, the minimum of three, the median, the 6-hour window, the depth floor and all pool accounting are untouched. Hook runtime grows from 23,611 to 23,873 bytes (703 below EIP-170). | `test/Revision.t.sol`: `testRevisionFlashObservationReadsTheBlockOpenPrice` (the reviewer's scenario, with a `FlashObserver` contract that asserts a zero MARG delta: every call settles Wrong, `leaderboardShare` is 0 and `claimLeaderboard` reverts `NothingToClaim`); `testRevisionObservationIgnoresASwapLaterInTheBlock` (a pump after the observation in the same block is not read; held across the gap it is); `testRevisionFlashMoveBeforePostingCannotSetThePostPrice` (a same-block dump before a Buy post and pump before a Sell post leave `postPrice` at the block-open price, and the sell deposit at the larger size); `testRevisionHeldMoveStillSettlesRight` (a genuine, held move still scores Right through the existing path). The reviewer's unedited scenario was also run as `test/scratch/ProofFlashObserve.t.sol` and passes. |
+
+Residual, stated for the hook launch's review: this is still not a TWAP. A manipulator who moves the price
+in block N and holds it until an observation in block N+1 (and does so three times, 20+ blocks apart) is
+not stopped by the block-open price; what stops them is that the position is held across a block boundary
+each time, open to arbitrage and to competing observers who can call `observe` for the note in block N
+itself (the gap counts from the last stored observation, so a timely honest observation in block N locks the
+moved price out of block N+1 as well). The SPEC's `univ4-spot` oracle recipe remains the documented
+escalation if that proves too thin; it is a design change and was not made here.
+
 ## Verification
 
 Final checks passed with the project's unchanged Foundry configuration:
 
 - `forge build` passed. `forge build --skip test --sizes` also passed: router 14,581 bytes, judge 12,176,
-  treasury 1,427; hook 23,611 bytes (965 bytes below EIP-170), hook initcode 25,263 bytes.
-- `forge test` passed: 66 tests, zero failures, one skipped fork suite. This comprises 62 durable project
-  tests and the four supplied proofs copied unchanged under `test/scratch/`. The revision adds 22 tests.
+  treasury 1,427 (all three unchanged by this revision); hook 23,873 bytes (703 bytes below EIP-170), hook
+  initcode 25,525 bytes.
+- `forge test --no-match-path 'test/fork/*'` passed: 67 tests, zero failures (66 durable project tests
+  plus the reviewer's scenario under `test/scratch/`). The first revision added 22 tests; this one adds 4.
+- The three implementation targets' source and bytecode are unchanged by this revision, so the
+  `Contracts.protected.t.sol` rehearsal result below stands.
 - The protected `Contracts.protected.t.sol` rehearsal passed with the built bytecode of all three
   implementation targets: no-argument nonpayable constructors deploy on an empty chain through the
   CREATE2 probe, predicted addresses match, runtimes fit, and no forbidden escape opcode exists. The
@@ -97,7 +125,7 @@ Final checks passed with the project's unchanged Foundry configuration:
 - All constructor ABI inputs are empty and their bytecode link-reference tables are empty.
 - The callback passes with an EOA signature and cold storage under 200,000 gas, as well as the existing
   protocol digest/selector/vector and ERC-1271 checks.
-- JSON responses cover all 25 finding ids. `git diff --check` passes.
+- `.imd-responses.json` answers both of this round's finding ids. `git diff --check` passes.
 
 The fork suite requires a mainnet RPC and was skipped. Slither and Mythril were not run. No transactions
 are broadcast and no wallet keys are read; the network's later manifest/deployment step launches the

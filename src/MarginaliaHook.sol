@@ -91,6 +91,10 @@ contract MarginaliaHook is IUnlockCallback {
     bool private imdIs0;
     PoolKey private pool;
     PoolId public poolId;
+    /// @dev The bound pool's price as the current block opened: recorded by the block's first swap, so
+    /// a price moved inside a block (a flash round-trip) is never the one a note is posted or observed at.
+    uint256 public lastSwapBlock;
+    uint256 public blockOpenPrice;
 
     // ------------------------------------------------------------------ notes
 
@@ -287,12 +291,34 @@ contract MarginaliaHook is IUnlockCallback {
         return PriceAdapters.fromSqrt(sqrtP, !imdIs0);
     }
 
+    /// @notice The bound pool's price as this block opened: the spot price unless the pool was swapped in
+    /// this block, in which case the price before that block's first swap. Nobody can set it in the block
+    /// they read it in; a price moved and unwound inside one transaction never reaches a note.
+    function blockPrice() public view returns (uint256) {
+        return lastSwapBlock == block.number ? blockOpenPrice : margPriceInImd();
+    }
+
+    /// @dev The price least favourable to a note's author among the block-open and the spot price, so a
+    /// flash move before posting cannot set the post price, while the author's own impact still counts.
+    function _postingPrice(T.Side side) private view returns (uint256) {
+        uint256 open = blockPrice();
+        uint256 spot = margPriceInImd();
+        if (side == T.Side.Buy) return open > spot ? open : spot;
+        return open < spot ? open : spot;
+    }
+
     function beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata data)
         external
         onlyManager
         returns (bytes4, BeforeSwapDelta, uint24)
     {
         _checkPool(key);
+        if (lastSwapBlock != block.number) {
+            // Every price move on the bound pool is a swap through this hook: the first one in a block
+            // records the price the block opened at, before it moves anything.
+            blockOpenPrice = margPriceInImd();
+            lastSwapBlock = block.number;
+        }
         bool buy = params.zeroForOne == imdIs0;
         uint8 kind = _dataKind(sender, data);
         uint256 specifiedTake = 0;
@@ -307,7 +333,8 @@ contract MarginaliaHook is IUnlockCallback {
             // A noted sell: the deposit is MARG taken off the specified input; the 1% fee and stamp come
             // off the IMD output in afterSwap. Exact input only.
             if (params.amountSpecified >= 0) revert NoteNeedsExactInput();
-            uint256 depositMarg = FullMath.mulDiv(DEPOSIT, 1e18, margPriceInImd());
+            // Sized at the lower of the block-open and spot price, so a flash pump cannot shrink it.
+            uint256 depositMarg = FullMath.mulDiv(DEPOSIT, 1e18, _postingPrice(T.Side.Sell));
             if (uint256(-params.amountSpecified) <= depositMarg * 2) revert NoteTooSmall();
             pendingSellDeposit = depositMarg;
             specifiedTake = depositMarg;
@@ -473,7 +500,7 @@ contract MarginaliaHook is IUnlockCallback {
             n.status = T.Status.ThesisOpen;
             weekTheses[_week()].push(id);
         } else {
-            n.postPrice = margPriceInImd();
+            n.postPrice = _postingPrice(p.side);
             n.postBalance = IERC20(p.x).balanceOf(author);
             if (p.x == token) {
                 // The router has already pulled a sell's gross MARG input. Only a buy's net output
@@ -517,7 +544,9 @@ contract MarginaliaHook is IUnlockCallback {
         return uint256(n.postedAt) + uint256(n.horizonDays) * 1 days;
     }
 
-    /// @notice Anyone records a price and balance observation inside the settlement window.
+    /// @notice Anyone records a price and balance observation inside the settlement window. The price is
+    /// the block-open price (`blockPrice`): a swap in the same block, before or after the call, cannot set it,
+    /// so a manipulator has to hold a moved price across the 20-block gaps between observations.
     function observe(bytes32 id) external {
         T.Note storage n = _note(id);
         if (n.status != T.Status.Open) revert NotOpen();
@@ -530,7 +559,7 @@ contract MarginaliaHook is IUnlockCallback {
             revert ObservationTooSoon();
         }
         _checkPriceLiquidity();
-        uint256 price = margPriceInImd();
+        uint256 price = blockPrice();
         uint256 balance = IERC20(n.x).balanceOf(n.author);
         obs.push(T.Observation(uint64(block.number), uint192(price), balance));
         emit Observed(id, uint64(block.number), price, balance);

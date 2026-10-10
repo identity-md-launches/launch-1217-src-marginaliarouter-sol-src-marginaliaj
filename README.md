@@ -81,8 +81,14 @@ an unjudged week's thesis pool forward after 28 days, once any pending request e
 - Price-scored calls are limited to MARG on the bound MARG/IMD pool, with correct subject, quote and
   direction, and at least 1,000 IMD of active virtual quote depth at posting and observation. Calls on
   arbitrary external tokens need a trustworthy pricing path before they can be enabled. All ERC-20s
-  remain available for trade-and-thesis notes. This removes self-priced cash leaderboard claims;
-  the existing multi-block median is still a spot-price design and can be affected by market manipulation.
+  remain available for trade-and-thesis notes. This removes self-priced cash leaderboard claims.
+- Prices a note is posted or observed at are the bound pool's block-open price (`blockPrice()`: recorded
+  by the first swap of a block in `beforeSwap`), never a price moved inside the same block, so a flash
+  round-trip in one transaction cannot set a post price or an observation. A post price is the less
+  favourable of the block-open and spot price for its side, so the author's own swap impact still counts.
+  The settle price is still the median of three or more observations at least 20 blocks apart, not a TWAP:
+  a manipulator has to hold a moved price across a block boundary for each observation, against arbitrage
+  and against anyone else observing the note first.
 - Sells of MARG pay 3% through any router, or 1% plus the stamp through `sellWithNote` with a note and deposit attached.
 - The X trade leg supports v4 pools (including native-ETH outputs), v3 pools and v2 pairs; exact-input only.
   V2 measures taxed inputs on both transfers. V3 and v4 enforce exact settlement and may reject transfer-tax

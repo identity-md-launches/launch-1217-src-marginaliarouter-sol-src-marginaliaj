@@ -16,6 +16,13 @@ import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {Fixture} from "./helpers/Fixture.sol";
 import {OracleAttestation} from "../src/OracleAttestation.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
+import {IUnlockCallback} from "v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {SwapParams} from "v4-core/src/types/PoolOperation.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
+import {TransientStateLibrary} from "v4-core/src/libraries/TransientStateLibrary.sol";
 
 // The installed Forge supports this cheatcode; the vendored older Vm interface omits it.
 interface RevisionColdVm {
@@ -34,6 +41,58 @@ contract TaxedInput is ERC20 {
             amount -= tax;
         }
         super._update(from, to, amount);
+    }
+}
+
+/// @dev The flash round-trip of finding 392cb896: inside one unlock, pump MARG with IMD, observe every note
+/// held, dump the MARG back, and settle only the net IMD (the fees). No MARG is held across the call.
+contract FlashObserver is IUnlockCallback {
+    using TransientStateLibrary for IPoolManager;
+
+    IPoolManager private immutable manager;
+    MarginaliaHook private immutable hook;
+
+    constructor(IPoolManager m, MarginaliaHook h) {
+        manager = m;
+        hook = h;
+    }
+
+    function run(PoolKey memory key, bool imdIs0, uint256 imdIn, bytes32[] memory ids) external {
+        manager.unlock(abi.encode(key, imdIs0, imdIn, ids));
+    }
+
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(manager));
+        (PoolKey memory key, bool imdIs0, uint256 imdIn, bytes32[] memory ids) =
+            abi.decode(data, (PoolKey, bool, uint256, bytes32[]));
+        BalanceDelta d = manager.swap(
+            key,
+            SwapParams(
+                imdIs0, -int256(imdIn), imdIs0 ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            ),
+            ""
+        );
+        int128 margOut = imdIs0 ? d.amount1() : d.amount0();
+        for (uint256 i; i < ids.length; ++i) {
+            hook.observe(ids[i]);
+        }
+        manager.swap(
+            key,
+            SwapParams(
+                !imdIs0, -int256(margOut), imdIs0 ? TickMath.MAX_SQRT_PRICE - 1 : TickMath.MIN_SQRT_PRICE + 1
+            ),
+            ""
+        );
+        Currency imd = imdIs0 ? key.currency0 : key.currency1;
+        require(
+            manager.currencyDelta(address(this), imdIs0 ? key.currency1 : key.currency0) == 0, "marg held"
+        );
+        int256 owed = manager.currencyDelta(address(this), imd);
+        require(owed < 0, "free round-trip");
+        manager.sync(imd);
+        IERC20(Currency.unwrap(imd)).transfer(address(manager), uint256(-owed));
+        manager.settle();
+        return "";
     }
 }
 
@@ -465,5 +524,109 @@ contract RevisionTest is Fixture {
         router.tradeAndNote(trade, p, 10 ether, 1, block.timestamp);
         assertEq(uint8(hook.noteOf(bytes32(uint256(1))).status), uint8(T.Status.ThesisOpen));
         assertEq(hook.noteOf(bytes32(uint256(1))).class, uint8(T.Class.Traded));
+    }
+
+    // ---------------------------------------------------------------- finding 392cb896: flash observations
+
+    /// @dev Three sybil +10% calls on a pool 100x the depth floor, the pot funded, the price never moving.
+    function _flashSetup() private returns (uint32 w, bytes32[] memory ids, address[3] memory sybils) {
+        liquidity.add(key, -6000, 6000, -int256(10_000_000 ether - 100_000 ether));
+        sybils = [alice, bob, carol];
+        imd.transfer(carol, 1_000 ether);
+        vm.prank(carol);
+        imd.approve(address(router), type(uint256).max);
+        w = hook.week();
+        vm.prank(alice);
+        hook.fundPot(20_000 ether);
+        ids = new bytes32[](3);
+        for (uint256 i; i < 3; ++i) {
+            (ids[i],) = _note(sybils[i], _margNote(T.Side.Buy, 11000, 1, "MARG +10% tomorrow"), 10 ether);
+        }
+    }
+
+    function testRevisionFlashObservationReadsTheBlockOpenPrice() public {
+        (uint32 w, bytes32[] memory ids, address[3] memory sybils) = _flashSetup();
+        FlashObserver attacker = new FlashObserver(manager, hook);
+        imd.transfer(address(attacker), 10_000 ether);
+        vm.warp(hook.horizonEnd(ids[0]));
+        for (uint256 i; i < 3; ++i) {
+            vm.roll(vm.getBlockNumber() + 25);
+            uint256 open = hook.margPriceInImd();
+            attacker.run(key, !margIs0, 5_900 ether, ids);
+            // Inside the round-trip the spot was +12%, but the observation stored the block's opening price.
+            assertEq(hook.blockPrice(), open);
+            assertLt(open * 10_000, 1.01e18 * 10_000);
+        }
+        vm.warp(hook.horizonEnd(ids[0]) + hook.SETTLE_WINDOW() + 1);
+        for (uint256 i; i < 3; ++i) {
+            hook.settle(ids[i]);
+            assertEq(uint8(hook.noteOf(ids[i]).status), uint8(T.Status.Wrong));
+        }
+        vm.warp(block.timestamp + 7 days);
+        for (uint256 i; i < 3; ++i) {
+            assertEq(hook.leaderboardShare(w, sybils[i]), 0);
+            vm.prank(sybils[i]);
+            vm.expectRevert(MarginaliaHook.NothingToClaim.selector);
+            hook.claimLeaderboard(w);
+        }
+    }
+
+    function testRevisionObservationIgnoresASwapLaterInTheBlock() public {
+        (bytes32 id,) = _note(alice, _margNote(T.Side.Buy, 11000, 1, "a"), 10 ether);
+        uint256 open = hook.margPriceInImd();
+        vm.warp(hook.horizonEnd(id));
+        vm.roll(vm.getBlockNumber() + 1);
+        // No swap yet this block: the observation is the spot, which is the block-open price.
+        hook.observe(id);
+        _buy(bob, 1_500_000 ether);
+        assertGt(hook.margPriceInImd(), 1.1e18);
+        assertEq(hook.blockPrice(), open);
+        // A second observation in the same block is refused by the gap anyway; after the gap, the pump counts
+        // only if it is still there, i.e. held across the gap.
+        vm.roll(vm.getBlockNumber() + 25);
+        hook.observe(id);
+        vm.roll(vm.getBlockNumber() + 25);
+        hook.observe(id);
+        vm.warp(hook.horizonEnd(id) + hook.SETTLE_WINDOW() + 1);
+        hook.settle(id);
+        assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.Right));
+    }
+
+    function testRevisionFlashMoveBeforePostingCannotSetThePostPrice() public {
+        liquidity.add(key, -6000, 6000, -int256(10_000_000 ether - 100_000 ether));
+        uint256 open = hook.margPriceInImd();
+        // Same block: dump MARG, post a +10% buy at the depressed spot, buy the MARG back.
+        uint256 got = _sell(bob, 6_000 ether);
+        uint256 depressed = hook.margPriceInImd();
+        assertLt(depressed * 10_000, open * 9_000);
+        (bytes32 id,) = _note(alice, _margNote(T.Side.Buy, 11000, 1, "a"), 10 ether);
+        _buy(bob, got);
+        // The post price is the block-open price, not the one the dump set.
+        assertGe(hook.noteOf(id).postPrice, open);
+        assertGt(hook.noteOf(id).postPrice, depressed);
+        // The mirror image for a sell: pump, then post a -10% sell, and the post price is the open price.
+        vm.roll(vm.getBlockNumber() + 1);
+        open = hook.margPriceInImd();
+        _buy(bob, 6_000 ether);
+        assertGt(hook.margPriceInImd() * 10_000, open * 11_000);
+        T.NoteParams memory p = _margNote(T.Side.Sell, 9000, 1, "s");
+        vm.startPrank(alice);
+        token.approve(address(router), type(uint256).max);
+        router.sellWithNote(p, 100 ether, 1, block.timestamp);
+        vm.stopPrank();
+        T.Note memory n = hook.noteOf(bytes32(hook.noteCount()));
+        assertLe(n.postPrice, open);
+        // And the deposit is sized at the lower price, so the pump could not shrink it.
+        assertGe(n.deposit, hook.DEPOSIT() * 1e18 / open - 1);
+    }
+
+    function testRevisionHeldMoveStillSettlesRight() public {
+        (bytes32 id,) = _note(alice, _margNote(T.Side.Buy, 11000, 1, "a"), 10 ether);
+        _buy(bob, 1_500_000 ether);
+        vm.warp(hook.horizonEnd(id));
+        vm.roll(vm.getBlockNumber() + 1);
+        assertEq(hook.blockPrice(), hook.margPriceInImd());
+        _resolve(id);
+        assertEq(uint8(hook.noteOf(id).status), uint8(T.Status.Right));
     }
 }
