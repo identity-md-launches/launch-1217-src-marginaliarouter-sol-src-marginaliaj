@@ -195,8 +195,8 @@ contract MainnetLaunchTest is Test {
         p.x = IMD;
         p.venue = T.Venue(T.VenueKind.UniV4, hook.HUB_POOL_ID(), address(0), false);
         p.side = T.Side.Sell;
-        p.targetBps = 7000;
-        p.horizonDays = 14;
+        p.targetBps = 0;
+        p.horizonDays = 0;
         p.class = uint8(T.Class.Declared);
         p.text = "IMD -30% in 14d: launch-night sells into a thin hub";
         uint256 ethBefore = alice.balance;
@@ -206,7 +206,7 @@ contract MainnetLaunchTest is Test {
         T.Note memory n = hook.noteOf(bytes32(hook.noteCount()));
         assertEq(uint8(n.class), uint8(T.Class.Traded));
         assertEq(n.x, IMD);
-        assertEq(n.postBalance, IERC20(IMD).balanceOf(alice));
+        assertEq(uint8(n.status), uint8(T.Status.ThesisOpen));
         // a traded note about a token other than the one traded is refused
         p.x = address(token);
         p.venue = T.Venue(T.VenueKind.UniV4, PoolId.unwrap(key.toId()), IMD, address(token) < IMD);
@@ -236,7 +236,7 @@ contract MainnetLaunchTest is Test {
         p.text = text;
     }
 
-    /// @dev Buy LINK with WETH on the live Uniswap v3 LINK/WETH 0.3% pool and post the call in one tx.
+    /// @dev Buy LINK with WETH on the live v3 pool and post a thesis; external spot venues cannot score.
     function testTradeAndNoteOnUniswapV3() public {
         _launch();
         address v3Pool = 0xa6Cc3C2531FdaA6Ae1A3CA84c2855806728693e8;
@@ -251,8 +251,8 @@ contract MainnetLaunchTest is Test {
         T.NoteParams memory p = _xNote(
             LINK,
             T.Venue(T.VenueKind.UniV3, bytes32(uint256(uint160(v3Pool))), WETH, LINK < WETH),
-            15_000,
-            30,
+            0,
+            0,
             "LINK 1.5x in 30d: CCIP volume"
         );
         uint256 linkBefore = IERC20(LINK).balanceOf(alice);
@@ -262,13 +262,13 @@ contract MainnetLaunchTest is Test {
         assertGt(IERC20(LINK).balanceOf(alice), linkBefore, "bought LINK");
         assertEq(uint8(n.class), uint8(T.Class.Traded));
         assertEq(n.x, LINK);
-        assertEq(n.postBalance, IERC20(LINK).balanceOf(alice));
-        assertGt(n.postPrice, 0);
+        assertEq(uint8(n.status), uint8(T.Status.ThesisOpen));
+        assertEq(n.postPrice, 0);
         emit log_named_uint("LINK price in IMD (1e18)", n.postPrice);
         assertEq(IERC20(WETH).balanceOf(address(router)), 0, "router holds nothing");
     }
 
-    /// @dev Buy UNI with WETH on the live Uniswap v2 UNI/WETH pair and post the call in one tx.
+    /// @dev Buy UNI with WETH on the live v2 pair and post a thesis; external spot venues cannot score.
     function testTradeAndNoteOnUniswapV2() public {
         _launch();
         address pair = 0xd3d2E2692501A5c9Ca623199D38826e513033a17;
@@ -283,8 +283,8 @@ contract MainnetLaunchTest is Test {
         T.NoteParams memory p = _xNote(
             UNI,
             T.Venue(T.VenueKind.UniV2, bytes32(uint256(uint160(pair))), WETH, UNI < WETH),
-            12_000,
-            14,
+            0,
+            0,
             "UNI +20% in 14d: fee switch"
         );
         uint256 uniBefore = IERC20(UNI).balanceOf(alice);
@@ -294,7 +294,7 @@ contract MainnetLaunchTest is Test {
         assertGt(IERC20(UNI).balanceOf(alice), uniBefore, "bought UNI");
         assertEq(uint8(n.class), uint8(T.Class.Traded));
         assertEq(n.x, UNI);
-        assertGt(n.postPrice, 0);
+        assertEq(n.postPrice, 0);
         emit log_named_uint("UNI price in IMD (1e18)", n.postPrice);
         // the wrong subject is refused on the v2 path too
         p.x = LINK;
@@ -313,8 +313,8 @@ contract MainnetLaunchTest is Test {
         p.x = IMD;
         p.venue = T.Venue(T.VenueKind.UniV4, hook.HUB_POOL_ID(), address(0), false);
         p.side = T.Side.Buy;
-        p.targetBps = 15_000;
-        p.horizonDays = 30;
+        p.targetBps = 0;
+        p.horizonDays = 0;
         p.class = uint8(T.Class.Declared);
         p.text = "IMD 1.5x in 30d: the hackathon launches are IMD-paired and every note here is an IMD buy";
         uint256 received = router.note(p, 20 ether, 1, block.timestamp + 1);
@@ -323,7 +323,7 @@ contract MainnetLaunchTest is Test {
         T.Note memory n = hook.noteOf(id);
         assertEq(n.author, alice);
         assertEq(n.x, IMD);
-        assertApproxEqRel(n.postPrice, 1e18, 0.01e18); // IMD priced in IMD through the hub ≈ 1
+        assertEq(n.postPrice, 0); // external assets can be discussed as theses, without cash-scored prices
         assertGt(received, 0);
         assertGt(n.deposit, 0);
         assertEq(

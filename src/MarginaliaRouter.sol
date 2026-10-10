@@ -194,7 +194,10 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
                 IERC20(xIn).safeTransferFrom(msg.sender, address(this), x.amountIn);
                 // traded inside the unlock
             } else {
+                uint256 before = IERC20(x.tokenIn).balanceOf(address(this));
                 IERC20(x.tokenIn).safeTransferFrom(msg.sender, address(this), x.amountIn);
+                x.amountIn = IERC20(x.tokenIn).balanceOf(address(this)) - before;
+                if (x.amountIn == 0 || x.amountIn > uint256(uint128(type(int128).max))) revert InvalidSwap();
                 (job.xResult, job.xIn, job.xOut) =
                     x.kind == X_V3 ? _tradeV3(msg.sender, x) : _tradeV2(msg.sender, x);
                 _checkSubject(job);

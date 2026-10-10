@@ -372,32 +372,17 @@ contract CompanionsTest is Fixture {
         assertEq(keccak256(body), intake.lastBodyHash());
         assertLe(body.length, 16_384, "body over the Intake's limit");
         assertLt(used, 8_000_000, "request too expensive"); // 30M+ before the linear body build; ~5M now
-        // the first MAX_JUDGED ids are listed, in posting order, and the last one is not
-        bytes memory firstId = bytes(vm.toString(bytes32(uint256(1))));
-        bytes memory lastId = bytes(vm.toString(bytes32(uint256(256))));
-        assertTrue(_contains(body, firstId));
-        assertFalse(_contains(body, lastId));
-        assertTrue(_contains(body, bytes(vm.toString(bytes32(judge.MAX_JUDGED())))));
-        assertFalse(_contains(body, bytes(vm.toString(bytes32(judge.MAX_JUDGED() + 1)))));
+        // Every thesis is in the on-chain collection named by the body; none is truncated.
+        assertTrue(_contains(body, bytes("thesesOfWeek")));
+        assertFalse(_contains(body, bytes("\"guards\"")));
     }
 
     function testQuestionBodyShape() public {
-        (uint32 w, bytes32[] memory ids) = _thesisWeek(2);
+        (uint32 w,) = _thesisWeek(2);
         bytes memory body = bytes(judge.questionBody(w));
-        bytes memory expected = bytes(
-            string.concat(
-                '"guards":{"allow":["',
-                vm.toString(ids[0]),
-                '","',
-                vm.toString(ids[1]),
-                '"]},"consumer":{"chainId":',
-                vm.toString(block.chainid),
-                ',"verifyingContract":"',
-                vm.toLowercase(vm.toString(address(judge))),
-                '"}}'
-            )
-        );
-        assertTrue(_contains(body, expected), string(body));
+        assertTrue(_contains(body, bytes(string.concat("thesesOfWeek(", vm.toString(w), ")"))));
+        assertTrue(_contains(body, bytes(vm.toLowercase(vm.toString(address(hook))))));
+        assertTrue(_contains(body, bytes("NotePosted")));
         assertTrue(_contains(body, bytes('"panelSize":7,"quorum":5,"validForSeconds":86400')));
     }
 

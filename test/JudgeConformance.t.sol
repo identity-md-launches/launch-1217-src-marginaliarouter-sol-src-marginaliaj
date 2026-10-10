@@ -36,6 +36,10 @@ contract StubHook {
         return 0;
     }
 
+    function thesisCount(uint32) external pure returns (uint256) {
+        return 1;
+    }
+
     function thesesOfWeek(uint32) external pure returns (bytes32[] memory ids) {
         ids = new bytes32[](1);
         ids[0] = bytes32(uint256(1));
@@ -51,7 +55,7 @@ contract StubHook {
 
     function payJudged(uint32, bytes32[3] calldata) external {}
 
-    function sellPotMarg(uint256) external pure returns (uint256) {
+    function sellPotMarg(uint256, uint256) external pure returns (uint256) {
         return 0;
     }
 }

@@ -1,9 +1,9 @@
 # Marginalia — notes in the margin of every trade
 
 A Uniswap v4 hook launch on the IMD protocol (Ethereum mainnet, paired with IMD). Buying MARG through the
-router with a note attached posts a falsifiable call on any ERC-20, backed by a flat stamp and a flat
-refundable deposit. Calls resolve against on-chain price observations; right calls get their deposit back,
-everything else feeds a pot that pays the best-argued notes of the day, ranked by the IMD oracle panel.
+router with a note attached posts a call on MARG or a thesis about any ERC-20, backed by a flat stamp
+and deposit. Price-scored calls use the bound MARG/IMD pool; arbitrary external venues cannot determine
+cash leaderboard payouts. The weekly thesis prize is ranked by the IMD oracle panel.
 No owner, no pause, no upgrade. Spec: `SPEC.md`.
 
 ## Contracts
@@ -26,8 +26,10 @@ Every IMD accrual (stamps, sell fees, converted forfeits, treasury drips) splits
 | 30% | the week's thesis prize | the panel's top three long-form theses, 50/30/20, after `requestJudging(week)` and `payJudged(week)` |
 | 20% | the day's writer refund | every non-retracted note of the day, equal split, capped at one stamp; `claimRefund(id)` after the day ends |
 
-Unclaimed pools roll forward after 28 days (`sweep`). Nothing in any pool is paid for a price outcome
-except through the score, which is difficulty-weighted, netted against wrong calls, and capped.
+Unclaimed pools roll forward after 28 days (`sweep`). Expired writer refunds move to the current week's
+leaderboard and thesis prizes in a 5:3 ratio. A swept leaderboard stops accepting claims. A live oracle
+request or an unpaid ranking reserves its thesis prize; an expired unanswered request permits sweeping.
+Leaderboard scores are difficulty-weighted, netted against wrong calls, and capped.
 
 ## Deployment order
 
@@ -38,7 +40,7 @@ except through the score, which is difficulty-weighted, netted against wrong cal
 3. Hook launch (manifest draft in `jobs/launch-hook.json`): the factory deploys the token and the hook; the
    hook's constructor clones the three implementations and initialises each with itself in the same transaction.
 
-The hook's initcode is ~24.5 KB (EIP-3860 cap 49,152) and its runtime ~23 KB (EIP-170 cap 24,576);
+The hook's initcode and runtime must fit the EIP-3860 (49,152) and EIP-170 (24,576) caps;
 `forge build --sizes` is the gate for both.
 
 ## Build and test
@@ -68,16 +70,32 @@ swarm's 10% goes to the launch's distributor.
 
 The router only counts a v3 pool or v2 pair the canonical mainnet Uniswap factory knows for its tokens as
 a trade (class Traded). The judge pays the Intake's live price up to 1 IMD, may re-request a week whose
-request got no answer within 3 days, stores a ranking with no eligible thesis as a week with no winners
-(the pool rolls forward on `payJudged`), and puts at most the first 200 theses of a week to the panel. The
-treasury takes no ETH. `sweep(2, week)` rolls a quiet week's thesis pool forward after 28 days.
+request got no answer within 3 days (at most two attempts per week), and stores a ranking with no eligible
+thesis as a week with no winners (the prize rolls forward on `payJudged`). Its bounded question directs the
+panel to the complete weekly collection through `thesesOfWeek`, or `thesisCount` and `thesisAt`, and to the
+`NotePosted` texts. It never truncates the eligible set. The treasury takes no ETH. `sweep(2, week)` rolls
+an unjudged week's thesis pool forward after 28 days, once any pending request expires.
 
 ## v1 scope and known limits
 
-- Price adapters assume 18-decimal assets on both sides. Quotes other than IMD, ETH or WETH are refused.
+- Price-scored calls are limited to MARG on the bound MARG/IMD pool, with correct subject, quote and
+  direction, and at least 1,000 IMD of active virtual quote depth at posting and observation. Calls on
+  arbitrary external tokens need a trustworthy pricing path before they can be enabled. All ERC-20s
+  remain available for trade-and-thesis notes. This removes self-priced cash leaderboard claims;
+  the existing multi-block median is still a spot-price design and can be affected by market manipulation.
 - Sells of MARG pay 3% through any router, or 1% plus the stamp through `sellWithNote` with a note and deposit attached.
-- The X trade leg supports v4 pools (including native-ETH pairs), v3 pools and v2 pairs; exact-input only.
+- The X trade leg supports v4 pools (including native-ETH outputs), v3 pools and v2 pairs; exact-input only.
+  V2 measures taxed inputs on both transfers. V3 and v4 enforce exact settlement and may reject transfer-tax
+  tokens even after the router measures its input budget.
 - The implementation addresses in `MarginaliaImpls.sol` are rehearsal placeholders; tests etch code there.
+  The later hook constructor refuses codeless targets. Replace these with this launch's confirmed addresses.
+- Unobserved noted sells forfeit their deposit; buy notes retain their existing no-data refund.
+- Pot conversions are permissionless once per UTC day, capped at 1% of active virtual MARG depth, with
+  at least 95% of the pre-sale spot value required. This bounds sale impact, not prior price manipulation.
+  Unconverted claims remain in `potMarg`; a partial fill reverts. Deposits can always be taken as MARG;
+  use `claimDeposit(id, true, minImdOut)` for an author-chosen conversion minimum. The compatible two-argument
+  overload has no author-chosen minimum.
+- Self-declared Attested notes are downgraded; only the implemented trade path can prove a Traded class.
 - The action fee on follow trades, treasury conversion of ETH/USDC/USDT to IMD, the on-chain ERC-8004 agent
   badge (contract wallets are marked Agent), and attestation re-delivery are specified but not yet built.
 - The judge binds an answer to the Intake request it paid for; it does not recompute the oracle's
