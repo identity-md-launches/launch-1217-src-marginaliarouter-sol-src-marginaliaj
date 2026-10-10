@@ -19,12 +19,25 @@ interface IMarginaliaHook {
     function token() external view returns (address);
 }
 
+interface IUniswapV3FactoryLookup {
+    function getPool(address tokenA, address tokenB, uint24 fee) external view returns (address pool);
+}
+
+interface IUniswapV2FactoryLookup {
+    function getPair(address tokenA, address tokenB) external view returns (address pair);
+}
+
 interface IUniswapV3PoolSwap {
     function token0() external view returns (address);
     function token1() external view returns (address);
-    function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160 sqrtPriceLimitX96, bytes calldata data)
-        external
-        returns (int256 amount0, int256 amount1);
+    function fee() external view returns (uint24);
+    function swap(
+        address recipient,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        bytes calldata data
+    ) external returns (int256 amount0, int256 amount1);
 }
 
 interface IUniswapV2PairSwap {
@@ -48,6 +61,12 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
     uint8 public constant X_V4 = 1;
     uint8 public constant X_V3 = 2;
     uint8 public constant X_V2 = 3;
+
+    /// @dev Ethereum mainnet's canonical Uniswap factories. A v3 pool or v2 pair handed to `tradeAndNote`
+    /// must be the one the factory knows for its tokens, so a caller cannot "prove" a trade on a contract
+    /// of their own. Checked on use, never in the constructor (the launch rehearses it on an empty chain).
+    address public constant V3_FACTORY = 0x1F98431c8aD98523631AE4a59f267346ea31F984;
+    address public constant V2_FACTORY = 0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f;
 
     /// @dev One X trade. v4 uses `key` + `zeroForOne`; v3 and v2 use `pool` + `tokenIn` (the pool decides the rest).
     struct XTrade {
@@ -80,10 +99,26 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
     error Slippage();
     error Expired();
     error NoteTokenMismatch();
+    error UnknownVenue();
     error AlreadyInitialised();
 
     event Noted(address indexed author, bool sellMarg, uint256 spent, uint256 received);
-    event XTraded(address indexed trader, uint8 kind, address indexed xIn, address indexed xOut, uint256 spent, uint256 received);
+    event XTraded(
+        address indexed trader,
+        uint8 kind,
+        address indexed xIn,
+        address indexed xOut,
+        uint256 spent,
+        uint256 received
+    );
+
+    /// @dev The implementation is an EIP-1167 target: its constructor fills the init guard with its own
+    /// address so the published implementation can never be initialised and pointed at another hook. A
+    /// clone starts with empty storage, so its `init` still runs once. Calls nothing: the launch rehearses
+    /// constructors on an empty chain.
+    constructor() {
+        hook = IMarginaliaHook(address(this));
+    }
 
     /// @dev Called once by the hook on its clone, in the hook's constructor. The implementation itself is
     /// never initialised and holds nothing.
@@ -118,21 +153,27 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
     }
 
     /// @notice Trade X (v4, v3 or v2) and post the note about it in one transaction (class Traded).
-    function tradeAndNote(XTrade calldata x, T.NoteParams calldata p, uint256 imdIn, uint256 minMargOut, uint256 deadline)
-        external
-        nonReentrant
-        returns (uint256)
-    {
+    function tradeAndNote(
+        XTrade calldata x,
+        T.NoteParams calldata p,
+        uint256 imdIn,
+        uint256 minMargOut,
+        uint256 deadline
+    ) external nonReentrant returns (uint256) {
         if (x.kind == X_NONE) revert InvalidSwap();
         return _run(false, imdIn, minMargOut, deadline, x, p);
     }
 
     // ------------------------------------------------------------------ core
 
-    function _run(bool sellMarg, uint256 amountIn, uint256 minOut, uint256 deadline, XTrade memory x, T.NoteParams memory p)
-        private
-        returns (uint256 received)
-    {
+    function _run(
+        bool sellMarg,
+        uint256 amountIn,
+        uint256 minOut,
+        uint256 deadline,
+        XTrade memory x,
+        T.NoteParams memory p
+    ) private returns (uint256 received) {
         if (block.timestamp > deadline) revert Expired();
         if (amountIn == 0 || amountIn > uint256(uint128(type(int128).max))) revert InvalidSwap();
         IERC20(sellMarg ? hook.token() : hook.imd()).safeTransferFrom(msg.sender, address(this), amountIn);
@@ -154,7 +195,8 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
                 // traded inside the unlock
             } else {
                 IERC20(x.tokenIn).safeTransferFrom(msg.sender, address(this), x.amountIn);
-                (job.xResult, job.xIn, job.xOut) = x.kind == X_V3 ? _tradeV3(msg.sender, x) : _tradeV2(msg.sender, x);
+                (job.xResult, job.xIn, job.xOut) =
+                    x.kind == X_V3 ? _tradeV3(msg.sender, x) : _tradeV2(msg.sender, x);
                 _checkSubject(job);
             }
         }
@@ -189,7 +231,11 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
 
         BalanceDelta delta = manager.swap(
             key,
-            SwapParams(zeroForOne, -int256(job.amountIn), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1),
+            SwapParams(
+                zeroForOne,
+                -int256(job.amountIn),
+                zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            ),
             hookData
         );
         int128 inputDelta = zeroForOne ? delta.amount0() : delta.amount1();
@@ -202,17 +248,26 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
         Currency receiveCurrency = zeroForOne ? key.currency1 : key.currency0;
         _pay(payCurrency, spent);
         manager.take(receiveCurrency, job.payer, received);
-        if (spent < job.amountIn) IERC20(Currency.unwrap(payCurrency)).safeTransfer(job.payer, job.amountIn - spent);
+        if (spent < job.amountIn) {
+            IERC20(Currency.unwrap(payCurrency)).safeTransfer(job.payer, job.amountIn - spent);
+        }
         emit Noted(job.payer, job.sellMarg, spent, received);
         return abi.encode(received);
     }
 
     // ------------------------------------------------------------------ X legs
 
-    function _tradeV4(address payer, XTrade memory x) private returns (uint256 received, address xIn, address xOut) {
+    function _tradeV4(address payer, XTrade memory x)
+        private
+        returns (uint256 received, address xIn, address xOut)
+    {
         BalanceDelta delta = manager.swap(
             x.key,
-            SwapParams(x.zeroForOne, -int256(x.amountIn), x.zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1),
+            SwapParams(
+                x.zeroForOne,
+                -int256(x.amountIn),
+                x.zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
+            ),
             ""
         );
         int128 inputDelta = x.zeroForOne ? delta.amount0() : delta.amount1();
@@ -232,23 +287,39 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
     }
 
     /// @dev Exact-input swap straight against a v3 pool; the pool pays the recipient, we pay in the callback.
-    function _tradeV3(address payer, XTrade memory x) private returns (uint256 received, address xIn, address xOut) {
+    function _tradeV3(address payer, XTrade memory x)
+        private
+        returns (uint256 received, address xIn, address xOut)
+    {
         IUniswapV3PoolSwap pool = IUniswapV3PoolSwap(x.pool);
         address t0 = pool.token0();
         address t1 = pool.token1();
+        // Only a pool the canonical factory deployed for these tokens and this fee counts as a trade.
+        if (IUniswapV3FactoryLookup(V3_FACTORY).getPool(t0, t1, pool.fee()) != x.pool) revert UnknownVenue();
         bool zeroForOne = x.tokenIn == t0;
         if (!zeroForOne && x.tokenIn != t1) revert InvalidSwap();
         xIn = x.tokenIn;
         xOut = zeroForOne ? t1 : t0;
         uint256 before = IERC20(xOut).balanceOf(payer);
+        // The router may already hold more of `xIn` than this leg (the note's IMD, pulled for the MARG buy),
+        // so what the leg spent is measured as a balance delta, and only the unspent part of it is refunded.
+        uint256 held = IERC20(xIn).balanceOf(address(this));
         v3Pending = x.pool;
-        pool.swap(payer, zeroForOne, int256(x.amountIn), zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1, "");
+        pool.swap(
+            payer,
+            zeroForOne,
+            int256(x.amountIn),
+            zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1,
+            ""
+        );
         delete v3Pending;
         received = IERC20(xOut).balanceOf(payer) - before;
         if (received < x.minOut || received == 0) revert Slippage();
-        uint256 left = IERC20(xIn).balanceOf(address(this));
+        uint256 spent = held - IERC20(xIn).balanceOf(address(this));
+        if (spent > x.amountIn) revert Slippage();
+        uint256 left = x.amountIn - spent;
         if (left > 0) IERC20(xIn).safeTransfer(payer, left);
-        emit XTraded(payer, X_V3, xIn, xOut, x.amountIn - left, received);
+        emit XTraded(payer, X_V3, xIn, xOut, spent, received);
     }
 
     function uniswapV3SwapCallback(int256 amount0Delta, int256 amount1Delta, bytes calldata) external {
@@ -259,10 +330,15 @@ contract MarginaliaRouter is IUnlockCallback, ReentrancyGuard {
     }
 
     /// @dev Exact-input swap against a v2 pair: send the input, take the constant-product output to the payer.
-    function _tradeV2(address payer, XTrade memory x) private returns (uint256 received, address xIn, address xOut) {
+    function _tradeV2(address payer, XTrade memory x)
+        private
+        returns (uint256 received, address xIn, address xOut)
+    {
         IUniswapV2PairSwap pair = IUniswapV2PairSwap(x.pool);
         address t0 = pair.token0();
         address t1 = pair.token1();
+        // Only the pair the canonical factory deployed for these tokens counts as a trade.
+        if (IUniswapV2FactoryLookup(V2_FACTORY).getPair(t0, t1) != x.pool) revert UnknownVenue();
         bool zeroForOne = x.tokenIn == t0;
         if (!zeroForOne && x.tokenIn != t1) revert InvalidSwap();
         xIn = x.tokenIn;

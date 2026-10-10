@@ -14,7 +14,7 @@ No owner, no pause, no upgrade. Spec: `SPEC.md`.
 | `MarginaliaHook` | The hook (flags `0x20cc`): binds the launch pool, takes the stamp and deposit on noted buys and the 1%/3% fee on sells, holds notes, observations, records and the three pools, and pays out. Its constructor clones the three companions (EIP-1167) from audited implementations and initialises each once. |
 | `MarginaliaRouter` | The only path that can attach a note; optionally trades X on Uniswap v4, v3 or v2 in the same transaction so the position is proven, and refuses a note about a token other than the one traded. Plain MARG buys and sells go through any v4 router. |
 | `MarginaliaJudge` | The oracle consumer: once a week buys the panel's ranking of the week's long-form theses through the IMD Intake, verifies the EIP-712 attestation, tells the hook whom to pay. Short-form calls are never judged. |
-| `MarginaliaTreasury` | Receives prizes and gifts; drips 2% of its IMD into the pot daily. No withdraw. |
+| `MarginaliaTreasury` | Receives prizes and gifts in IMD; drips 2% of its IMD into the pot daily. No withdraw, no ETH. |
 
 ## How the pot pays
 
@@ -31,11 +31,12 @@ except through the score, which is difficulty-weighted, netted against wrong cal
 
 ## Deployment order
 
-1. Contracts-only launch: `MarginaliaRouter`, `MarginaliaJudge`, `MarginaliaTreasury` implementations
-   (ownerless; never initialised themselves).
+1. Contracts-only launch (evm_contracts, no constructor arguments): `MarginaliaRouter`, `MarginaliaJudge`,
+   `MarginaliaTreasury` implementations. Each constructor fills its own init guard, so the published
+   implementations can never be initialised; only their clones can, once. See `ADAPTATION.md`.
 2. Set the three addresses in `src/MarginaliaImpls.sol`.
-3. Hook launch (`launch.json`): the factory deploys the token and the hook; the hook's constructor clones
-   the three implementations and initialises each with itself in the same transaction.
+3. Hook launch (manifest draft in `jobs/launch-hook.json`): the factory deploys the token and the hook; the
+   hook's constructor clones the three implementations and initialises each with itself in the same transaction.
 
 The hook's initcode is ~24.5 KB (EIP-3860 cap 49,152) and its runtime ~23 KB (EIP-170 cap 24,576);
 `forge build --sizes` is the gate for both.
@@ -59,9 +60,17 @@ MAINNET_RPC_URL=https://... forge test --match-path test/fork/MainnetLaunch.t.so
 
 ## Launch
 
-`launch.json` is the factory manifest: `MarginaliaHook($poolManager, $token, $factory)`, permissions as
-listed, pool paired with IMD at fee 12500 / tick spacing 60. The requester's share seeds the pool
-single-sided; the swarm's 10% goes to the launch's distributor.
+The companions launch first, as a contracts-only launch whose manifest lists `MarginaliaRouter`,
+`MarginaliaJudge` and `MarginaliaTreasury` with no constructor arguments. `jobs/launch-hook.json` is the
+hook launch's manifest draft: `MarginaliaHook($poolManager, $token, $factory)`, permissions as listed, pool
+paired with IMD at fee 12500 / tick spacing 60. The requester's share seeds the pool single-sided; the
+swarm's 10% goes to the launch's distributor.
+
+The router only counts a v3 pool or v2 pair the canonical mainnet Uniswap factory knows for its tokens as
+a trade (class Traded). The judge pays the Intake's live price up to 1 IMD, may re-request a week whose
+request got no answer within 3 days, stores a ranking with no eligible thesis as a week with no winners
+(the pool rolls forward on `payJudged`), and puts at most the first 200 theses of a week to the panel. The
+treasury takes no ETH. `sweep(2, week)` rolls a quiet week's thesis pool forward after 28 days.
 
 ## v1 scope and known limits
 

@@ -174,7 +174,9 @@ contract MarginaliaHook is IUnlockCallback {
         string text
     );
     event Observed(bytes32 indexed id, uint64 blockNumber, uint256 price, uint256 balance);
-    event Settled(bytes32 indexed id, T.Status status, uint256 settlePrice, int256 scoreDelta, address keeper);
+    event Settled(
+        bytes32 indexed id, T.Status status, uint256 settlePrice, int256 scoreDelta, address keeper
+    );
     event Retracted(bytes32 indexed id, string text);
     event DepositClaimed(bytes32 indexed id, address indexed to, bool asImd, uint256 amount);
     event ThesisReleased(bytes32 indexed id);
@@ -225,7 +227,11 @@ contract MarginaliaHook is IUnlockCallback {
 
     // ------------------------------------------------------------------ pool binding
 
-    function beforeInitialize(address sender, PoolKey calldata key, uint160) external onlyManager returns (bytes4) {
+    function beforeInitialize(address sender, PoolKey calldata key, uint160)
+        external
+        onlyManager
+        returns (bytes4)
+    {
         if (sender != factory || initialized || key.fee != LP_FEE || address(key.hooks) != address(this)) {
             revert InvalidPool();
         }
@@ -381,7 +387,11 @@ contract MarginaliaHook is IUnlockCallback {
         emit Accrued(day, amount);
     }
 
-    function _decodeNote(bytes calldata data) private pure returns (T.NoteParams memory p, address author, uint256 xResult) {
+    function _decodeNote(bytes calldata data)
+        private
+        pure
+        returns (T.NoteParams memory p, address author, uint256 xResult)
+    {
         (, p, author, xResult) = abi.decode(data, (uint8, T.NoteParams, address, uint256));
         if (author == address(0)) revert BadHookData();
     }
@@ -399,7 +409,9 @@ contract MarginaliaHook is IUnlockCallback {
             if (p.side == T.Side.Buy) {
                 if (p.targetBps < 10_000 + MIN_TARGET_DELTA_BPS) revert InvalidNote();
             } else {
-                if (p.targetBps >= 10_000 || p.targetBps + MIN_TARGET_DELTA_BPS > 10_000) revert InvalidNote();
+                if (p.targetBps >= 10_000 || p.targetBps + MIN_TARGET_DELTA_BPS > 10_000) {
+                    revert InvalidNote();
+                }
             }
             if (p.x == address(0) || p.x.code.length == 0) revert InvalidNote();
         }
@@ -438,7 +450,18 @@ contract MarginaliaHook is IUnlockCallback {
         }
         records[author].posted += 1;
         emit NotePosted(
-            id, author, p.x, class, p.side, p.targetBps, p.horizonDays, n.postPrice, depositMarg, p.parentId, xResult, p.text
+            id,
+            author,
+            p.x,
+            class,
+            p.side,
+            p.targetBps,
+            p.horizonDays,
+            n.postPrice,
+            depositMarg,
+            p.parentId,
+            xResult,
+            p.text
         );
     }
 
@@ -775,7 +798,9 @@ contract MarginaliaHook is IUnlockCallback {
         emit RefundClaimed(id, msg.sender, amount);
     }
 
-    /// @notice Rolls what a day's refund pool or a week's leaderboard pool left unclaimed into the current one.
+    /// @notice Rolls what a day's refund pool (kind 0), a week's leaderboard pool (kind 1) or a week's thesis
+    /// pool (kind 2: a week with no thesis, under the judge threshold, or never judged) left unclaimed into
+    /// the current one.
     function sweep(uint8 kind, uint32 epoch) external {
         uint256 amount;
         if (kind == 0) {
@@ -783,6 +808,11 @@ contract MarginaliaHook is IUnlockCallback {
             amount = refundPool[epoch];
             refundPool[epoch] = 0;
             refundPool[_today()] += amount;
+        } else if (kind == 2) {
+            if (block.timestamp < (uint256(epoch) + 1) * 7 days + SWEEP_AFTER) revert TooEarly();
+            amount = thesisPool[epoch];
+            thesisPool[epoch] = 0;
+            thesisPool[_week()] += amount;
         } else {
             if (block.timestamp < (uint256(epoch) + 1) * 7 days + SWEEP_AFTER) revert TooEarly();
             amount = leaderboardPool[epoch] - leaderboardSwept[epoch];
@@ -799,7 +829,10 @@ contract MarginaliaHook is IUnlockCallback {
         return uint256(uint160(c));
     }
 
-    function _unlock(uint8 action, address to, uint256 amount, uint256 extra) private returns (uint256 result) {
+    function _unlock(uint8 action, address to, uint256 amount, uint256 extra)
+        private
+        returns (uint256 result)
+    {
         bytes memory data = abi.encode(action, to, amount, extra);
         unlockHash = keccak256(data);
         bytes memory out = poolManager.unlock(data);
@@ -810,7 +843,8 @@ contract MarginaliaHook is IUnlockCallback {
     function unlockCallback(bytes calldata data) external onlyManager returns (bytes memory) {
         if (unlockHash == bytes32(0) || keccak256(data) != unlockHash) revert InvalidUnlock();
         delete unlockHash;
-        (uint8 action, address to, uint256 amount, uint256 extra) = abi.decode(data, (uint8, address, uint256, uint256));
+        (uint8 action, address to, uint256 amount, uint256 extra) =
+            abi.decode(data, (uint8, address, uint256, uint256));
         if (action == ACT_PAY) {
             address currency = address(uint160(extra));
             poolManager.burn(address(this), _id(currency), amount);
